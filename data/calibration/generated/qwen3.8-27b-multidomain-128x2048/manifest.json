@@ -1,0 +1,204 @@
+{
+  "model_id": "Qwen/Qwen3.8-27B",
+  "tokenizer_name_or_path": "Qwen/Qwen3.8-27B",
+  "sequence_length": 2048,
+  "num_samples": 128,
+  "tokens_total": 262144,
+  "seed": 42,
+  "dataset_path": "/Users/roman/Documents/q38/nanokvant/NanoQuant/data/calibration/generated/qwen3.8-27b-multidomain-128x2048/dataset",
+  "schema": {
+    "input_ids": "list[int] of length 2048",
+    "attention_mask": "list[int] of length 2048, all ones",
+    "source": "string",
+    "domain": "string",
+    "language": "string",
+    "prompt_language": "string"
+  },
+  "counts": {
+    "source": {
+      "aya_collection_language_split": 48,
+      "mimo-v2.6-rl-oss": 28,
+      "stack-v3-train": 32,
+      "hermes-function-calling-v1": 16,
+      "ko-agent-trajectories-1.0": 4
+    },
+    "domain": {
+      "multilingual-instruction": 48,
+      "general-agent": 8,
+      "code": 32,
+      "agentic-coding": 20,
+      "tool-use-and-structured-output": 16,
+      "korean-tool-agent": 4
+    },
+    "language": {
+      "Russian": 7,
+      "mixed": 28,
+      "JavaScript": 4,
+      "English": 23,
+      "Chinese": 7,
+      "TypeScript": 4,
+      "Korean": 10,
+      "Spanish": 7,
+      "German": 7,
+      "Go": 4,
+      "Rust": 4,
+      "Python": 4,
+      "French": 7,
+      "Java": 4,
+      "C++": 4,
+      "Shell": 4
+    },
+    "prompt_language": {
+      "Russian": 7,
+      "mixed": 28,
+      "English": 51,
+      "Chinese": 7,
+      "Korean": 14,
+      "Spanish": 7,
+      "German": 7,
+      "French": 7
+    }
+  },
+  "sources": [
+    {
+      "repo_id": "CohereLabs/aya_collection_language_split",
+      "config": "english",
+      "split": "train",
+      "rows_scanned": 115,
+      "blocks": 7
+    },
+    {
+      "repo_id": "CohereLabs/aya_collection_language_split",
+      "config": "russian",
+      "split": "train",
+      "rows_scanned": 18,
+      "blocks": 7
+    },
+    {
+      "repo_id": "CohereLabs/aya_collection_language_split",
+      "config": "chinese",
+      "split": "train",
+      "rows_scanned": 47,
+      "blocks": 7
+    },
+    {
+      "repo_id": "CohereLabs/aya_collection_language_split",
+      "config": "spanish",
+      "split": "train",
+      "rows_scanned": 104,
+      "blocks": 7
+    },
+    {
+      "repo_id": "CohereLabs/aya_collection_language_split",
+      "config": "german",
+      "split": "train",
+      "rows_scanned": 19,
+      "blocks": 7
+    },
+    {
+      "repo_id": "CohereLabs/aya_collection_language_split",
+      "config": "french",
+      "split": "train",
+      "rows_scanned": 17,
+      "blocks": 7
+    },
+    {
+      "repo_id": "CohereLabs/aya_collection_language_split",
+      "config": "korean",
+      "split": "train",
+      "rows_scanned": 16,
+      "blocks": 6
+    },
+    {
+      "repo_id": "NousResearch/hermes-function-calling-v1",
+      "config": "func_calling_singleturn",
+      "split": "train",
+      "rows_scanned": 15,
+      "blocks": 6
+    },
+    {
+      "repo_id": "NousResearch/hermes-function-calling-v1",
+      "config": "func_calling",
+      "split": "train",
+      "rows_scanned": 9,
+      "blocks": 6
+    },
+    {
+      "repo_id": "NousResearch/hermes-function-calling-v1",
+      "config": "json_mode_agentic",
+      "split": "train",
+      "rows_scanned": 6,
+      "blocks": 2
+    },
+    {
+      "repo_id": "NousResearch/hermes-function-calling-v1",
+      "config": "json_mode_singleturn",
+      "split": "train",
+      "rows_scanned": 10,
+      "blocks": 2
+    },
+    {
+      "repo_id": "XiaomiMiMo/MiMo-V2.6-RL-oss",
+      "config": "code",
+      "split": "train",
+      "rows_scanned": 85,
+      "blocks": 20
+    },
+    {
+      "repo_id": "taejoon89/Ko-Agent-Trajectories-1.0",
+      "config": "train",
+      "split": "train",
+      "rows_scanned": 6,
+      "blocks": 4,
+      "license": "CC-BY-4.0",
+      "attribution": "Imjin Ahn, Young-Hak Kim, Sanghyun Park, and Tae Joon Jun"
+    },
+    {
+      "repo_id": "XiaomiMiMo/MiMo-V2.6-RL-oss",
+      "config": "general",
+      "split": "train",
+      "rows_scanned": 89,
+      "blocks": 8,
+      "filter": "data_source=mimoagent/general_agent; not terminal_bench"
+    },
+    {
+      "repo_id": "HuggingFaceCode/stack-v3-train",
+      "config": "default",
+      "split": "train",
+      "license_filter": "permissive and not vendor",
+      "rows_scanned": 15387,
+      "blocks_by_language": {
+        "Python": 4,
+        "JavaScript": 4,
+        "TypeScript": 4,
+        "Java": 4,
+        "C++": 4,
+        "Go": 4,
+        "Rust": 4,
+        "Shell": 4
+      },
+      "blocks": 32
+    }
+  ],
+  "attribution": [
+    {
+      "dataset": "taejoon89/Ko-Agent-Trajectories-1.0",
+      "license": "CC-BY-4.0",
+      "authors": [
+        "Imjin Ahn",
+        "Young-Hak Kim",
+        "Sanghyun Park",
+        "Tae Joon Jun"
+      ],
+      "config": "train"
+    }
+  ],
+  "benchmark_exclusions": [
+    "datacurve/deep-swe",
+    "harborframework/terminal-bench-2.1",
+    "harborframework/terminal-bench",
+    "hkust-nlp/Toolathlon",
+    "mimoagent/terminal_bench examples in the MiMo general config",
+    "taejoon89/Ko-Agent-Trajectories-1.0 eval split (train split only)"
+  ]
+}
