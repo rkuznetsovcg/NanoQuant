@@ -12,6 +12,25 @@ from ..kernel.utils import (binary_packer, binary_unpacker, gemlite_nanoquant_pa
                             marlin_nanoquant_packer)
 
 
+class _PackedBinaryLinear(torch.autograd.Function):
+    """Linear with a frozen 1-bit weight, unpacked only for each matmul."""
+
+    @staticmethod
+    def forward(ctx, x, packed_weight, out_features, in_features):
+        ctx.weight_shape = (int(out_features), int(in_features))
+        ctx.input_dtype = x.dtype
+        ctx.save_for_backward(packed_weight)
+        weight = binary_unpacker(packed_weight, ctx.weight_shape).to(dtype=x.dtype)
+        return F.linear(x, weight)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (packed_weight,) = ctx.saved_tensors
+        weight = binary_unpacker(packed_weight, ctx.weight_shape).to(dtype=grad_output.dtype)
+        grad_input = F.linear(grad_output, weight.mT).to(dtype=ctx.input_dtype)
+        return grad_input, None, None, None
+
+
 class NanoQuantLinear(nn.Module):
     def __quant_convert__(
         self,
@@ -104,6 +123,10 @@ class NanoQuantLinear(nn.Module):
         return (y - x).detach() + x
 
     def forward(self, x):
+        if getattr(self, "_kd_packed_training", False):
+            orig_dtype = x.dtype
+            y = self._compute_packed_forward(x.to(self.dtype))
+            return y.to(orig_dtype) if y.dtype != orig_dtype else y
         if getattr(self, "do_kernel_inference", False):
             orig_dtype = x.dtype
             if x.dtype != self.dtype:
@@ -256,6 +279,43 @@ class NanoQuantLinear(nn.Module):
         y = y * scale_post
         return y
 
+    def _compute_packed_forward(self, x):
+        x = x * self.scale_pre
+        hidden = _PackedBinaryLinear.apply(x, self._kd_V_packed, self._kd_V_shape[0], self._kd_V_shape[1])
+        if getattr(self, "scale_mid", None) is not None:
+            hidden = hidden * self.scale_mid
+        output = _PackedBinaryLinear.apply(
+            hidden, self._kd_U_packed, self._kd_U_shape[0], self._kd_U_shape[1]
+        )
+        output = output * self.scale_post
+        return output + self.bias if self.bias is not None else output
+
+    def begin_kd_packed_factors(self):
+        """Replace frozen BF16 sign matrices with compact packed buffers for KD."""
+        if getattr(self, "_kd_packed_training", False):
+            return
+        self._kd_V_shape = tuple(self.V.shape)
+        self._kd_U_shape = tuple(self.U.shape)
+        self.register_buffer("_kd_V_packed", binary_packer(self.V.detach().to(torch.int8)), persistent=False)
+        self.register_buffer("_kd_U_packed", binary_packer(self.U.detach().to(torch.int8)), persistent=False)
+        delattr(self, "V")
+        delattr(self, "U")
+        self._kd_packed_training = True
+
+    def end_kd_packed_factors(self):
+        """Restore regular BF16 factors after global distillation."""
+        if not getattr(self, "_kd_packed_training", False):
+            return
+        v = binary_unpacker(self._kd_V_packed, self._kd_V_shape).to(dtype=self.dtype)
+        u = binary_unpacker(self._kd_U_packed, self._kd_U_shape).to(dtype=self.dtype)
+        delattr(self, "_kd_V_packed")
+        delattr(self, "_kd_U_packed")
+        self.V = nn.Parameter(v, requires_grad=False)
+        self.U = nn.Parameter(u, requires_grad=False)
+        del self._kd_V_shape
+        del self._kd_U_shape
+        self._kd_packed_training = False
+
     def quantize(self, x):
         if self._binarized:
             return x
@@ -309,10 +369,10 @@ class NanoQuantLinear(nn.Module):
         state = super().state_dict(*args, **kwargs)
         prefix = kwargs.get("prefix", "")
 
-        keys_to_remove = [k for k in state.keys() if ".V" in k or ".U" in k]
-        for k in keys_to_remove:
-            if k in state:
-                del state[k]
+        # Recursive state_dict shares its destination with sibling modules.
+        # Remove only this module's raw factors, never another layer's packs.
+        for name in ("U", "V"):
+            state.pop(prefix + name, None)
 
         packed_weights = self.pack_weights()
         for k, v in packed_weights.items():
@@ -340,7 +400,7 @@ class NanoQuantLinear(nn.Module):
             if packed_key in state_dict and shape_key in state_dict:
                 packed_val = state_dict.pop(packed_key)
                 shape = state_dict.pop(shape_key)
-                unpacked_tensor = binary_unpacker(packed_val).view(tuple(shape)).to(self.dtype)
+                unpacked_tensor = binary_unpacker(packed_val, tuple(shape.tolist())).to(self.dtype)
                 setattr(self, param_name, nn.Parameter(unpacked_tensor, requires_grad=False))
 
         unpack_param("V")

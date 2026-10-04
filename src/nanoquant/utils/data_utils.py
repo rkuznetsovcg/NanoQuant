@@ -20,14 +20,19 @@ def get_calib_loader(dataset_path, tokenizer, n_samples=128, seed=0, seqlen=2048
     """
     Creates a dataloader for calibration.
     """
-    if type(dataset_path) == "str":
+    if isinstance(dataset_path, (str, os.PathLike)):
         print(f"Loading dataset from disk: {dataset_path}")
         ds = datasets.load_from_disk(dataset_path)
     else:
         ds = dataset_path
 
+    if len(ds) == 0:
+        raise ValueError("Calibration dataset is empty.")
+
     set_seed(seed)
-    inds = np.random.randint(0, len(ds), size=(n_samples, ))
+    # Keep every curated calibration example when the dataset is large enough.
+    # Replacement is needed only when the requested sample count exceeds it.
+    inds = np.random.choice(len(ds), size=n_samples, replace=n_samples > len(ds))
 
     input_ids = [ds[int(i)]["input_ids"] for i in inds]
 

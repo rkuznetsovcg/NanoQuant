@@ -37,6 +37,8 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 from ..core.compress_model import compress_block_recon, compress_model_recon
 from ..core.importance import collect_stats, get_shrunk_stats, register_stats
+from ..core.resume import has_block_checkpoint
+from ..core.reconstruction_plan import validate_reconstruction_config
 from ..modules.linear import NanoQuantLinear
 from ..utils.data_utils import get_calib_loader, prepare_dataset
 from ..utils.load_utils import (get_compressed_state_dict, load_compressed_model, load_model, load_tokenizer)
@@ -81,6 +83,35 @@ class NanoQuantConfigDataclass:
     model_kd_lr: float = 1e-5
     model_kd_batch_size: int = 1
     model_kd_epochs: int = 8
+    # optional runtime controls; appended to preserve positional callers
+    model_kd_num_samples: int = 64
+    block_io_batch_size: int = 4
+    eval_after_each_block: bool = False
+    admm_warm_start_iters: int = 2
+    log_reconstruction_error: bool = False
+    rank_allocation: str = "sensitivity"
+    admm_early_stop: bool = True
+    admm_min_outer_iters: int = 120
+    admm_check_interval: int = 10
+    admm_convergence_tolerance: float = 2e-3
+    admm_stable_sign_tolerance: float = 1e-3
+    admm_rho_stop_threshold: float = 0.85
+    model_kd_vocab_chunk_size: int = 4096
+    model_kd_pack_factors: bool = False
+    require_fast_linear_attention: bool = False
+    attn_implementation: str = "auto"
+    tune_schedule: str = "sequential"
+    layer_epoch_schedule: bool = True
+    refresh_input_stats: bool = True
+    resume_dir: str = ""
+    rank_budget: str = "nominal"
+    rank_probe_candidates: int = 0
+    rank_probe_iters: int = 50
+    correlation_block_size: int = 0
+    correlation_layers: str = "mlp.down_proj"
+    nonfact_plateau_tolerance: float = 0.0
+    nonfact_plateau_min_epochs: int = 3
+    nonfact_plateau_patience: int = 2
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -292,10 +323,13 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
             # This appears to be a quantized model, load accordingly
             model = load_compressed_model(model_name_or_path=config.model_id, checkpoint_path=local_path,
                                           seqlen=config.seqlen, device=device_map,
-                                          has_mid_scale=(config.admm_type == 'dbf'), dtype=dtype)
+                                          has_mid_scale=(config.admm_type == 'dbf'), dtype=dtype,
+                                          attn_implementation=config.attn_implementation)
         else:
             # This is likely a base model, load normally
-            model = load_model(config.model_id, config.seqlen, device_map=device_map)
+            model = load_model(config.model_id, config.seqlen, device_map=device_map,
+                               require_fast_linear_attention=config.require_fast_linear_attention,
+                               attn_implementation=config.attn_implementation)
             model = model.to(dtype)
 
         # Load base model info (Optional)
@@ -327,11 +361,18 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
         """
         # Convert config to dict for compatibility with existing functions
         quant_dict = quant_config.to_dict()
+        quant_dict['model_id'] = model_id
+        validate_reconstruction_config(quant_dict)
 
-        # Load model and fp_model
+        # Keep one full-precision model during block reconstruction. Each block
+        # is used to produce its reference outputs immediately before it is
+        # replaced, so a second full model copy is unnecessary here.
         device_map = quant_dict.get('device_map', 'cpu')
-        model = load_model(model_id, quant_dict['seqlen'], device_map=device_map)
-        fp_model = load_model(model_id, quant_dict['seqlen'], device_map=device_map)
+        model = load_model(
+            model_id, quant_dict['seqlen'], device_map=device_map,
+            require_fast_linear_attention=quant_dict.get('require_fast_linear_attention', False),
+            attn_implementation=quant_dict.get('attn_implementation', 'auto'),
+        )
 
         # Load dataloader
         data = prepare_dataset(model_id, quant_dict)
@@ -340,17 +381,20 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
                                       quant_dict['seqlen'])
 
         # Get importance via calibration
-        raw_stats = collect_stats(model, dataloader, "cuda", strategy=quant_dict['calib_strategy'])
-        shrunk_stats = get_shrunk_stats(raw_stats, shrinkage=quant_dict['calib_shrinkage'])
-        model = register_stats(model, shrunk_stats)
+        if not has_block_checkpoint(quant_dict):
+            raw_stats = collect_stats(model, dataloader, "cuda", strategy=quant_dict['calib_strategy'])
+            shrunk_stats = get_shrunk_stats(raw_stats, shrinkage=quant_dict['calib_shrinkage'])
+            model = register_stats(model, shrunk_stats)
 
         # Compress the model
-        model = compress_block_recon(model, fp_model, dataloader, quant_dict)
+        model = compress_block_recon(model, None, dataloader, quant_dict)
         
         # Model-level KD tuning (only if enabled)
         if quant_config.tune_model:
             logger.info("Performing model-level KD tuning...")
-            model = compress_model_recon(model, fp_model, dataloader, quant_dict)
+            # Let KD own the temporary teacher so it can free the weights as
+            # soon as hidden-state caching finishes, before student training.
+            model = compress_model_recon(model, None, dataloader, quant_dict)
 
         return model
 
@@ -433,7 +477,8 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
         quant_dict = quant_config.to_dict()
         model = load_compressed_model(model_name_or_path=quant_dict['model_id'], checkpoint_path=qmodel_path,
                                       seqlen=quant_dict['seqlen'], has_mid_scale=(quant_dict['admm_type'] == 'dbf'),
-                                      device=device_map, dtype=dtype)
+                                      device=device_map, dtype=dtype,
+                                      attn_implementation=quant_dict.get('attn_implementation', 'auto'))
         return cls(model, quant_config, base_model_id=quant_dict['model_id'])
 
     @classmethod

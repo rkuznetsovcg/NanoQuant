@@ -95,10 +95,12 @@ def _online_clipping_hook(module, inputs, outputs, layer_name, stats_dict, run_s
 
     if gmax is None:
         gmax = tau
-    elif tau > gmax:
-        correction = (tau / (gmax + 1e-8)).square()
+    else:
+        # Keep the condition on the GPU; a Python tensor comparison would
+        # synchronize every forward/backward statistics hook with the CPU.
+        correction = torch.where(tau > gmax, (tau / (gmax + 1e-8)).square(), torch.ones_like(tau))
         stats_dict[key][layer_name].mul_(correction.to(stats_dev))
-        gmax = tau
+        gmax = torch.maximum(gmax, tau)
 
     state["global_max"] = gmax
 

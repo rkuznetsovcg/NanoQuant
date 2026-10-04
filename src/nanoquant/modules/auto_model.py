@@ -8,6 +8,8 @@ import torch
 
 from ..core.compress_model import compress_block_recon, compress_model_recon
 from ..core.importance import collect_stats, get_shrunk_stats, register_stats
+from ..core.resume import has_block_checkpoint
+from ..core.reconstruction_plan import validate_reconstruction_config
 from ..utils.data_utils import get_calib_loader, prepare_dataset
 from ..utils.load_utils import (get_compressed_state_dict, load_compressed_model, load_model, load_tokenizer)
 
@@ -44,10 +46,17 @@ class AutoNQModel():
         """
         Quantize model
         """
-        # load model and fp_model
+        quant_config = dict(quant_config)
+        quant_config['model_id'] = model_id
+        validate_reconstruction_config(quant_config)
+        # Only one full model is needed for blockwise reconstruction: each
+        # original block is evaluated before its weights are replaced.
         device_map = quant_config.get('device_map', 'cpu')
-        model = load_model(model_id, quant_config['seqlen'], device_map=device_map)
-        fp_model = load_model(model_id, quant_config['seqlen'], device_map=device_map)
+        model = load_model(
+            model_id, quant_config['seqlen'], device_map=device_map,
+            require_fast_linear_attention=quant_config.get('require_fast_linear_attention', False),
+            attn_implementation=quant_config.get('attn_implementation', 'auto'),
+        )
 
         # load dataloader
         data = prepare_dataset(model_id, quant_config)
@@ -56,12 +65,15 @@ class AutoNQModel():
                                       quant_config['seqlen'])
 
         # get importance via calibration
-        raw_stats = collect_stats(model, dataloader, "cuda", strategy=quant_config['calib_strategy'])
-        shrunk_stats = get_shrunk_stats(raw_stats, shrinkage=quant_config['calib_shrinkage'])
-        model = register_stats(model, shrunk_stats)
+        if not has_block_checkpoint(quant_config):
+            raw_stats = collect_stats(model, dataloader, "cuda", strategy=quant_config['calib_strategy'])
+            shrunk_stats = get_shrunk_stats(raw_stats, shrinkage=quant_config['calib_shrinkage'])
+            model = register_stats(model, shrunk_stats)
 
-        model = compress_block_recon(model, fp_model, dataloader, quant_config)
-        model = compress_model_recon(model, fp_model, dataloader, quant_config)
+        model = compress_block_recon(model, None, dataloader, quant_config)
+        if quant_config.get('tune_model', True):
+            # KD owns the temporary teacher and releases it after caching.
+            model = compress_model_recon(model, None, dataloader, quant_config)
 
         return model
 
@@ -71,7 +83,8 @@ class AutoNQModel():
         """
         return load_compressed_model(model_name_or_path=model_id, checkpoint_path=qmodel_path,
                                      seqlen=quant_config['seqlen'], has_mid_scale=(quant_config['admm_type'] == 'dbf'),
-                                     device=device_map, dtype=dtype)
+                                     device=device_map, dtype=dtype,
+                                     attn_implementation=quant_config.get('attn_implementation', 'auto'))
 
     def save_model(self, model, qmodel_path):
         """

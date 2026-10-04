@@ -3,6 +3,7 @@
 *.arrow
 *.pt
 *.log
+/data/calibration/generated/
 
 
 # Byte-compiled / optimized / DLL files
@@ -221,3 +222,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Reconstruction shards, activation snapshots and rank probe caches
+work/
