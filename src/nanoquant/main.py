@@ -283,6 +283,7 @@ def main():
             num_fewshot=eval_args.num_fewshot,
             limit=eval_args.limit,
             batch_size="auto" if eval_args.batch_size is None else eval_args.batch_size,
+            calibration_dataset_path=quant_config.calib_dataset,
         )
         logger.info(f"Results:\n{json.dumps(results, indent=2)}")
     except Exception as e:

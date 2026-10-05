@@ -88,6 +88,68 @@ def evaluate_ppl(model, testenc, dev, dataset_name, args=None, verbose=True):
 
 
 @torch.no_grad()
+def evaluate_ppl_on_windows(model, dataset, dev, dataset_name, verbose=True):
+    """Evaluate PPL on independent token windows without joining their boundaries."""
+    model.eval().to(dev)
+    seqlen = getattr(model, 'seqlen', model.config.max_position_embeddings)
+    loss_fct = nn.CrossEntropyLoss(reduction="none")
+    total_nll = torch.zeros((), dtype=torch.float64, device=dev)
+    total_tokens = 0
+
+    if verbose:
+        print(f"Evaluating PPL on {dataset_name}: {len(dataset)} windows, max seqlen={seqlen}")
+        pbar = tqdm(range(len(dataset)), desc=f"Evaluating PPL for {dataset_name}")
+    else:
+        pbar = range(len(dataset))
+
+    for index in pbar:
+        row = dataset[index]
+        input_ids = torch.as_tensor(row["input_ids"], dtype=torch.long)
+        if input_ids.ndim != 1:
+            raise ValueError(f"Expected 1D input_ids in window {index}; got shape {tuple(input_ids.shape)}")
+        input_ids = input_ids[:seqlen]
+        if input_ids.numel() < 2:
+            continue
+        input_ids = input_ids.unsqueeze(0).to(dev)
+
+        attention_mask = row.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = torch.as_tensor(attention_mask, dtype=torch.long)[:input_ids.shape[1]]
+            attention_mask = attention_mask.unsqueeze(0).to(dev)
+            if attention_mask[:, 1:].sum().item() == 0:
+                continue
+            outputs = model(input_ids, attention_mask=attention_mask, use_cache=False)
+        else:
+            outputs = model(input_ids, use_cache=False)
+
+        shift_logits = outputs.logits[:, :-1, :].contiguous()
+        shift_labels = input_ids[:, 1:].contiguous()
+        token_nll = loss_fct(
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1),
+        )
+
+        if attention_mask is not None:
+            loss_mask = attention_mask[:, 1:].reshape(-1).to(token_nll.dtype)
+            total_nll += (token_nll * loss_mask).sum().to(torch.float64)
+            total_tokens += int(loss_mask.sum().item())
+        else:
+            total_nll += token_nll.sum().to(torch.float64)
+            total_tokens += shift_labels.numel()
+
+        if verbose and (index + 1) % 8 == 0 and total_tokens:
+            pbar.set_postfix(ppl=f"{torch.exp(total_nll / total_tokens).item():.4f}")
+
+    if total_tokens == 0:
+        raise ValueError(f"No valid next-token labels found in {dataset_name}")
+
+    ppl = torch.exp(total_nll / total_tokens).item()
+    if verbose:
+        print(f"Perplexity on {dataset_name}: {ppl:.4f} ({total_tokens} predicted tokens)")
+    return ppl, total_tokens
+
+
+@torch.no_grad()
 def evaluate_ppl_after_block(model, model_name, dev, get_test_ppl=True):
     """
     Function to evaluate PPL after block-wise processing during the compression stage.
@@ -114,6 +176,7 @@ def evaluate_model(
     limit=-1,
     batch_size=1,
     args=None,
+    calibration_dataset_path=None,
 ):
     """
     Main function to comprehensively evaluate a final model on PPL and/or zero-shot tasks.
@@ -127,6 +190,26 @@ def evaluate_model(
         datasets = [ds.strip() for ds in eval_ppl.split(',') if ds.strip()]
         for dataset in datasets:
             try:
+                if dataset.lower() in {"calibration", "calib"}:
+                    if not calibration_dataset_path:
+                        raise ValueError("PPL task 'calibration' requires a calibration dataset path")
+                    from datasets import load_from_disk
+
+                    calibration_windows = load_from_disk(calibration_dataset_path)
+                    ppl_result, predicted_tokens = evaluate_ppl_on_windows(
+                        model,
+                        calibration_windows,
+                        device,
+                        "calibration set (in-sample)",
+                        verbose=True,
+                    )
+                    results["calibration_in_sample"] = {
+                        "ppl": ppl_result,
+                        "windows": len(calibration_windows),
+                        "predicted_tokens": predicted_tokens,
+                    }
+                    continue
+
                 from ..utils.data_utils import get_test_loaders
                 _, testloader = get_test_loaders(dataset, model_name=model.config._name_or_path, seqlen=model.seqlen)
                 ppl_result = evaluate_ppl(model, testloader, device, dataset, args, verbose=True)
