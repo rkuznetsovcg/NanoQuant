@@ -6,6 +6,7 @@ import json
 import torch.nn as nn
 import torch
 from lm_eval.evaluator import simple_evaluate
+from lm_eval.models.huggingface import HFLM
 from tqdm import tqdm
 
 
@@ -230,17 +231,17 @@ def evaluate_model(
         if task_names:
             print(f"[INFO] Starting zero-shot evaluation for tasks: {', '.join(task_names)}")
 
+            lm = HFLM(
+                pretrained=model,
+                tokenizer=tokenizer,
+                batch_size=batch_size,
+            )
             harness_results = simple_evaluate(
-                model="hf",
-                model_args={
-                    "pretrained": model,
-                    "tokenizer": tokenizer,
-                },
+                model=lm,
                 tasks=task_names,
                 num_fewshot=num_fewshot,
-                batch_size=batch_size,
-                device=str(device),
                 limit=None if limit == -1 else limit,
+                log_samples=False,
             )
             results.update(harness_results["results"])
 
