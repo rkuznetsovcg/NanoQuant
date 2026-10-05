@@ -12,6 +12,17 @@ from ..kernel.utils import (binary_packer, binary_unpacker, gemlite_nanoquant_pa
                             marlin_nanoquant_packer)
 
 
+class _BinarySignSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value):
+        signs = value.sign()
+        return signs.masked_fill_(signs == 0, 1)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output
+
+
 class _PackedBinaryLinear(torch.autograd.Function):
     """Linear with a frozen 1-bit weight, unpacked only for each matmul."""
 
@@ -118,9 +129,9 @@ class NanoQuantLinear(nn.Module):
             delattr(self, "scale_mid")
 
     def binary_ste(self, x):
-        y = x.sign()
-        y[y == 0] = 1
-        return (y - x).detach() + x
+        # The subtraction-based STE loses the +/-1 in BF16 when |x| is
+        # large. Return the exact signs and provide the identity backward.
+        return _BinarySignSTE.apply(x)
 
     def forward(self, x):
         if getattr(self, "_kd_packed_training", False):
@@ -355,6 +366,8 @@ class NanoQuantLinear(nn.Module):
             if param is None:
                 return
             param_bin = self.binary_ste(param.data) if self.do_train else param.data
+            if not torch.all((param_bin == 1) | (param_bin == -1)):
+                raise ValueError(f"Cannot pack {param_name}: factors must contain only -1 and +1")
             packed_data[f"{param_name}_packed"] = binary_packer(param_bin.to(torch.int8))
             packed_data[f"{param_name}_shape"] = torch.tensor(param.shape, dtype=torch.long)
 
@@ -401,7 +414,10 @@ class NanoQuantLinear(nn.Module):
                 packed_val = state_dict.pop(packed_key)
                 shape = state_dict.pop(shape_key)
                 unpacked_tensor = binary_unpacker(packed_val, tuple(shape.tolist())).to(self.dtype)
-                setattr(self, param_name, nn.Parameter(unpacked_tensor, requires_grad=False))
+                # Let PyTorch consume the actual key as usual. Installing a
+                # Parameter here without its state key falsely reports it as
+                # missing under strict loading and breaks block resume.
+                state_dict[prefix + param_name] = unpacked_tensor
 
         unpack_param("V")
         unpack_param("U")

@@ -6,7 +6,6 @@ from importlib import import_module
 from importlib.util import find_spec
 import os
 import time
-from collections import OrderedDict
 from typing import Any, Dict, List
 
 import torch
@@ -95,13 +94,6 @@ def load_model(model_id, seqlen=2048, device_map="cpu", require_fast_linear_atte
     
     For large models (>70B), use device_map="auto" with max_memory for GPU+CPU offloading.
     """
-    def skip(*args, **kwargs):
-        pass
-
-    nn.init.kaiming_uniform_ = skip
-    nn.init.uniform_ = skip
-    nn.init.normal_ = skip
-
     # load model from huggingface
     print(f"Loading model '{model_id}'...")
 
@@ -178,7 +170,6 @@ def load_model(model_id, seqlen=2048, device_map="cpu", require_fast_linear_atte
                 "This may cause issues if the model uses learned positional embeddings.")
 
     elif seqlen != -1:
-        model.config.max_position_embeddings = seqlen
         model.seqlen = seqlen
 
     return model
@@ -316,25 +307,12 @@ def get_compressed_state_dict(model: nn.Module):
     """
     from ..modules.linear import NanoQuantLinear
 
-    final_state_dict = OrderedDict()
-
-    # 1. First add parameters from modules that are not custom layers
-    for name, param in model.named_parameters():
-        module_path = name.rsplit('.', 1)[0]
-        try:
-            module = model.get_submodule(module_path)
-            if not isinstance(module, NanoQuantLinear):
-                final_state_dict[name] = param.data
-        except AttributeError:
-            final_state_dict[name] = param.data
-
-    # 2. Iterate through custom modules and add using custom state_dict
-    for name, mod in model.named_modules():
-        if isinstance(mod, NanoQuantLinear):
-            module_state_dict = mod.state_dict(prefix=name + '.')
-            final_state_dict.update(module_state_dict)
-
-    return final_state_dict
+    for name, module in model.named_modules():
+        if isinstance(module, NanoQuantLinear) and module.do_train:
+            raise ValueError(f"Cannot export unfinished training factors in {name}; finalize them first")
+    # Recursive state_dict invokes NanoQuantLinear's packer and retains every
+    # persistent buffer and tied alias. Calibration buffers are nonpersistent.
+    return model.state_dict()
 
 
 def _load_and_process_state_dict(checkpoint_path: str, dtype: torch.dtype) -> Dict[str, Any]:
@@ -378,9 +356,19 @@ def _load_and_process_state_dict(checkpoint_path: str, dtype: torch.dtype) -> Di
         sk = f"{prefix}.{base}_shape"
         st = shapes.get(sk, None)
         if st is None:
-            continue
+            raise ValueError(f"Packed factor {pk} is missing its shape key {sk}")
+        if f"{prefix}.{base}" in out:
+            raise ValueError(f"Checkpoint contains both packed and unpacked factors for {prefix}.{base}")
         shape = tuple(int(x) for x in (st.tolist() if isinstance(st, torch.Tensor) else st))
+        if len(shape) != 2 or any(size <= 0 for size in shape):
+            raise ValueError(f"Invalid shape for {pk}: {shape}")
+        if pv.dtype != torch.int32:
+            raise ValueError(f"Packed factor {pk} must be int32, got {pv.dtype}")
         out[f"{prefix}.{base}"] = binary_unpacker(pv, shape).to(dtype)
+
+    orphan_shapes = [key for key in shapes if key[:-6]+"_packed" not in packed]
+    if orphan_shapes:
+        raise ValueError(f"Shape metadata without packed factors: {orphan_shapes[:10]}")
 
     del packed, shapes
     cleanup_memory()
@@ -423,9 +411,13 @@ def load_compressed_model(model_name_or_path: str, checkpoint_path: str, seqlen:
             if type(module) is nn.Linear and "lm_head" not in name:
                 base = f"{name}."
                 if (base + "V") in sd or (base + "U") in sd:
+                    required = ("V", "U", "scale_pre", "scale_post")
+                    missing = [base + key for key in required if base + key not in sd]
+                    if missing:
+                        raise RuntimeError(f"Incomplete compressed layer {name}; missing weights: {missing}")
                     module.__class__ = NanoQuantLinear
                     rank = sd[base + "V"].shape[0]
-                    module.init_for_inference(rank=rank, has_scale_mid=has_mid_scale)
+                    module.init_for_inference(rank=rank, has_scale_mid=(base + "scale_mid") in sd)
 
     print("INFO: Converting layers to compressed format...")
     convert_layers(model)
@@ -433,15 +425,28 @@ def load_compressed_model(model_name_or_path: str, checkpoint_path: str, seqlen:
     print("INFO: Loading weights into the model...")
     if meta_init:
         try:
-            model.load_state_dict(sd, strict=False, assign=True)
+            incompatible = model.load_state_dict(sd, strict=False, assign=True)
         except TypeError:
             # assign=True unsupported -> guaranteed fallback path
             model = AutoModelForCausalLM.from_config(config)
             convert_layers(model)
-            model.load_state_dict(sd, strict=False)
+            incompatible = model.load_state_dict(sd, strict=False)
             meta_init = False
     else:
-        model.load_state_dict(sd, strict=False)
+        incompatible = model.load_state_dict(sd, strict=False)
+
+    # Only a genuinely tied head may be absent from an older export. Other
+    # missing keys must never fall back to empty CPU memory or initial values.
+    tied_head = bool(getattr(model.config, "tie_word_embeddings", False))
+    embedding = model.get_input_embeddings()
+    embedding_key = next((f"{name}.weight" for name, module in model.named_modules() if module is embedding), None)
+    allowed_missing = {"lm_head.weight"} if tied_head and embedding_key in sd else set()
+    missing = [key for key in incompatible.missing_keys if key not in allowed_missing]
+    if missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            f"Checkpoint does not match the model: missing weights={missing[:20]}, "
+            f"unexpected weights={incompatible.unexpected_keys[:20]}"
+        )
 
     # Handle tied / missing lm_head weights (common when output head tied to embeddings)
     if meta_init and hasattr(model, "tie_weights"):
@@ -449,28 +454,6 @@ def load_compressed_model(model_name_or_path: str, checkpoint_path: str, seqlen:
             model.tie_weights()
         except Exception:
             pass
-
-    if meta_init and hasattr(model, "lm_head") and getattr(getattr(model.lm_head, "weight", None), "is_meta", False):
-        # Materialize lm_head on CPU (to_empty if available; else allocate)
-        if hasattr(model.lm_head, "to_empty") and callable(model.lm_head.to_empty):
-            model.lm_head.to_empty(device="cpu")
-        else:
-            w = model.lm_head.weight
-            model.lm_head.weight = nn.Parameter(torch.empty(w.shape, device="cpu", dtype=dtype), requires_grad=True)
-
-        # Tie again; if tie_weights logic changes, force alias to embeddings
-        try:
-            model.tie_weights()
-        except Exception:
-            pass
-        if getattr(model.lm_head.weight, "is_meta", False) and hasattr(model, "get_input_embeddings"):
-            emb = model.get_input_embeddings()
-            if emb is not None and hasattr(emb, "weight") and not getattr(emb.weight, "is_meta", False):
-                model.lm_head.weight = emb.weight
-
-        # Bias (if present) must not remain meta
-        if getattr(getattr(model.lm_head, "bias", None), "is_meta", False):
-            model.lm_head.bias = nn.Parameter(torch.zeros(model.lm_head.weight.shape[0], device="cpu", dtype=dtype))
 
     if meta_init:
         leftover = [n for n, p in model.named_parameters() if getattr(p, "is_meta", False)]
@@ -485,10 +468,10 @@ def load_compressed_model(model_name_or_path: str, checkpoint_path: str, seqlen:
     total_gb = 0
     for param in model.parameters():
         total_gb += param.nelement() * param.element_size() / (1024**3)
-    print(f"Loaded compressed model size: {total_gb:.2f} GB")
+    print(f"Loaded compressed model size: {total_gb:.2f} GiB (unpacked factors and unchanged weights)")
 
     model.seqlen = seqlen if seqlen != -1 else config.max_position_embeddings
     model.eval()
     print(f"model.seqlen={model.seqlen}")
-    print(f"Compressed model successfully loaded to {device} in {time.time() - t0:.2f}s")
+    print(f"Checkpoint loaded on CPU in {time.time() - t0:.2f}s; execution device: {device}")
     return model

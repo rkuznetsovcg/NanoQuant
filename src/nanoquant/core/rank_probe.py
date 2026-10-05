@@ -67,6 +67,26 @@ def allocate_measured_ranks(modules, initial, curves, num_scales=2):
     while candidates:
         _score, key, next_rank, cost = heapq.heappop(candidates)
         if used+cost > budget:
+            # A 32-rank quantum may miss a useful affordable increment when
+            # the two matrices have different row-padding costs. Find the
+            # largest smaller increment and compare its actual marginal gain
+            # against the other candidates before spending the remainder.
+            current = result[key]
+            lower, upper = current, next_rank-1
+            while lower < upper:
+                middle = (lower+upper+1)//2
+                delta = packed_bits(modules[key], middle, num_scales)-packed_bits(
+                    modules[key], current, num_scales)
+                if used+delta <= budget:
+                    lower = middle
+                else:
+                    upper = middle-1
+            if lower > current:
+                level, eta, _lower, _upper = curves[key]
+                cost = packed_bits(modules[key], lower, num_scales)-packed_bits(
+                    modules[key], current, num_scales)
+                gain = level*(current**(-eta)-lower**(-eta))
+                heapq.heappush(candidates, (-gain/cost, key, lower, cost))
             continue
         used += cost
         result[key] = next_rank

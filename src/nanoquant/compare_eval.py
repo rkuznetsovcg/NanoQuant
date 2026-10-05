@@ -8,9 +8,11 @@ import datetime
 import gc
 import hashlib
 import json
+import math
 import re
 import shutil
 import tempfile
+from importlib.metadata import version
 from pathlib import Path
 from numbers import Real
 from statistics import mean
@@ -18,6 +20,7 @@ from statistics import mean
 import torch
 from transformers import AutoConfig
 
+from .checkpoint_audit import inspect_checkpoint
 from .utils.eval_utils import evaluate_model
 from .utils.load_utils import load_compressed_model, load_model, load_tokenizer
 from .utils.utils import cleanup_memory, set_seed
@@ -27,7 +30,7 @@ def _write_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.with_suffix(path.suffix + ".tmp")
     temporary_path.write_text(
-        json.dumps(value, indent=2, ensure_ascii=False, default=_json_default) + "\n",
+        json.dumps(value, indent=2, ensure_ascii=False, default=_json_default, allow_nan=False) + "\n",
         encoding="utf-8",
     )
     temporary_path.replace(path)
@@ -59,24 +62,44 @@ def _validate_results(
     require_kld: bool = False,
 ) -> None:
     missing = []
+    invalid = []
     for dataset in ppl_datasets:
         key = "calibration_in_sample" if dataset.lower() in {"calibration", "calib"} else dataset
         if key not in results or not isinstance(results[key], dict) or "ppl" not in results[key]:
             missing.append(f"PPL:{key}")
+        else:
+            value = results[key]["ppl"]
+            if not isinstance(value, Real) or not math.isfinite(value) or value <= 0:
+                invalid.append(f"PPL:{key}")
     for task in task_names:
         task_result = results.get(task)
         if not isinstance(task_result, dict) or _primary_accuracy(task_result)[1] is None:
             missing.append(f"zero-shot:{task}")
+        else:
+            value = _primary_accuracy(task_result)[1]
+            if not math.isfinite(value) or not 0 <= value <= 1:
+                invalid.append(f"zero-shot:{task}")
     if require_kld and not isinstance(results.get("wikitext2_kld_full_vocab"), dict):
         missing.append("KL:WikiText-2 full vocabulary")
+    elif require_kld:
+        kl = results["wikitext2_kld_full_vocab"]
+        for key in ("mean_nats_per_token", "median_nats_per_token", "p90_nats_per_token", "p99_nats_per_token"):
+            value = kl.get(key)
+            if not isinstance(value, Real) or not math.isfinite(value) or value < 0:
+                invalid.append(f"KL:{key}")
+        if not isinstance(kl.get("predicted_positions"), int) or kl["predicted_positions"] < 1:
+            invalid.append("KL:predicted_positions")
     if missing:
         raise RuntimeError(f"{label} evaluation did not produce required metrics: {', '.join(missing)}")
+    if invalid:
+        raise RuntimeError(f"{label} metrics must be finite and in range: {', '.join(invalid)}")
 
 
 def _recover_bf16_results_from_log(
     log_path: Path,
     ppl_datasets: list[str],
     expected_revision: str,
+    expected_protocol: dict | None = None,
 ) -> dict | None:
     """Recover completed baseline metrics when an older evaluator failed after logging them."""
     if not log_path or not log_path.is_file():
@@ -85,6 +108,15 @@ def _recover_bf16_results_from_log(
     bf16_start = log_text.find("===== bf16: загрузка модели =====")
     if bf16_start < 0:
         return None
+    if expected_protocol is not None:
+        protocol_line = re.search(r"^NANOQUANT_EVAL_PROTOCOL (.+)$", log_text[:bf16_start], re.MULTILINE)
+        if protocol_line is None:
+            return None
+        try:
+            if json.loads(protocol_line.group(1)) != expected_protocol:
+                return None
+        except json.JSONDecodeError:
+            return None
     nanoquant_start = log_text.find("===== nanoquant:", bf16_start + 1)
     bf16_log = log_text[bf16_start:nanoquant_start] if nanoquant_start >= 0 else log_text[bf16_start:]
     revision_match = re.search(r"Ревизия модели:\s*([0-9a-f]{40,64})", log_text[:bf16_start])
@@ -148,8 +180,9 @@ def _evaluate_one(
     kld_only=False,
 ):
     print(f"\n===== {label}: загрузка модели =====", flush=True)
-    model = model_factory()
+    model = None
     try:
+        model = model_factory()
         tokenizer = tokenizer_factory()
         model.config.use_cache = False
         model.seqlen = protocol["sequence_length"]
@@ -170,12 +203,16 @@ def _evaluate_one(
             limit=protocol["limit"],
             batch_size=protocol["batch_size"],
             calibration_dataset_path=protocol["calibration_dataset"],
+            seed=protocol["seed"],
             kld_role="reference" if label == "bf16" else "candidate",
             kld_cache_dir=str(kld_cache_dir),
             kld_sample_stride=protocol["kl_divergence"]["position_stride"],
             kld_metadata={
                 "base_model_id": protocol["model_id"],
                 "base_model_revision": protocol["model_revision"],
+                "evaluation_code_sha256": protocol["evaluation_code_sha256"],
+                "runtime_versions": protocol["runtime_versions"],
+                "attention_backend": protocol["attention_backend"],
             },
         )
         results = dict(state["results"].get(label, {})) if kld_only else {}
@@ -191,6 +228,11 @@ def _evaluate_one(
         _write_json(output_path, state)
         print(f"===== {label}: оценка завершена =====", flush=True)
         return results
+    except Exception as error:
+        state.update({"status": "failed", "failed_model": label,
+                      "error": f"{type(error).__name__}: {error}"})
+        _write_json(output_path, state)
+        raise
     finally:
         del model
         gc.collect()
@@ -254,6 +296,7 @@ def main():
     parser.add_argument("--output", required=True, help="Paired comparison JSON output")
     parser.add_argument("--revision", default=None, help="Pinned Hugging Face model commit")
     parser.add_argument("--revision-source", default="provided", help="How the model revision was selected")
+    parser.add_argument("--fresh", action="store_true", help="Evaluate both models again; ignore previous metrics and KL cache")
     parser.add_argument(
         "--resume-log",
         default=None,
@@ -308,7 +351,21 @@ def main():
     if not ppl_datasets or not task_names:
         raise ValueError("Paired comparison requires PPL datasets and zero-shot tasks")
 
+    evaluation_code = hashlib.sha256()
+    for relative_path in ("compare_eval.py", "checkpoint_audit.py", "utils/eval_utils.py", "utils/load_utils.py", "modules/linear.py"):
+        evaluation_code.update((Path(__file__).parent/relative_path).read_bytes())
+    calibration_digest = hashlib.sha256()
+    for data_path in sorted(calibration_path.rglob("*")):
+        if data_path.is_file():
+            calibration_digest.update(str(data_path.relative_to(calibration_path)).encode())
+            with data_path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024*1024), b""):
+                    calibration_digest.update(chunk)
     protocol = {
+        "evaluation_schema": 2,
+        "evaluation_code_sha256": evaluation_code.hexdigest(),
+        "runtime_versions": {package: version(package) for package in ("torch", "transformers", "lm_eval", "datasets")},
+        "calibration_sha256": calibration_digest.hexdigest(),
         "model_id": model_id,
         "model_revision": source_revision,
         "model_revision_source": "run metadata" if recorded_revision else args.revision_source,
@@ -339,20 +396,22 @@ def main():
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"NANOQUANT_EVAL_PROTOCOL {json.dumps(protocol, ensure_ascii=False, sort_keys=True)}", flush=True)
+    print(f"Ревизия модели: {source_revision}", flush=True)
     state = {
         "status": "running",
         "protocol": protocol,
         "results": {},
     }
-    if output_path.is_file():
+    if output_path.is_file() and not args.fresh:
         previous = json.loads(output_path.read_text(encoding="utf-8"))
         if previous.get("protocol") == protocol:
             state["results"] = previous.get("results", {})
             print("Совпадающий предыдущий результат найден; уже готовая модель будет пропущена.", flush=True)
 
-    if "bf16" not in state["results"] and args.resume_log:
+    if "bf16" not in state["results"] and args.resume_log and not args.fresh:
         recovered = _recover_bf16_results_from_log(
-            Path(args.resume_log), ppl_datasets, expected_revision=source_revision,
+            Path(args.resume_log), ppl_datasets, expected_revision=source_revision, expected_protocol=protocol,
         )
         if recovered is not None:
             try:
@@ -370,6 +429,15 @@ def main():
 
     cache_key = hashlib.sha256(str(output_path).encode("utf-8")).hexdigest()[:20]
     kld_cache_dir = Path(tempfile.gettempdir()) / "nanoquant-paired-kld" / cache_key
+    if args.fresh:
+        shutil.rmtree(kld_cache_dir, ignore_errors=True)
+        print("Свежий прогон: обе модели и KL будут пересчитаны.", flush=True)
+    state["checkpoint_audit"] = inspect_checkpoint(checkpoint_path, source_config, float(profile.get("bits", 0.55)))
+    _write_json(output_path, state)
+    if state["checkpoint_audit"]["errors"]:
+        state["status"] = "invalid_checkpoint"
+        _write_json(output_path, state)
+        raise RuntimeError(f"Checkpoint has invalid weights. Details saved in {output_path}")
     required_fast_attention = bool(profile.get("require_fast_linear_attention", False))
     backend = protocol["attention_backend"]
 

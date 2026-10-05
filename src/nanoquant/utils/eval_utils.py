@@ -6,7 +6,6 @@ import json
 import shutil
 from pathlib import Path
 
-import torch.nn as nn
 import torch
 import numpy as np
 from lm_eval.evaluator import simple_evaluate
@@ -14,12 +13,33 @@ from lm_eval.models.huggingface import HFLM
 from tqdm import tqdm
 
 
+def _next_token_nll(logits, labels, mask=None, chunk_size=128):
+    """Sum next-token loss in FP32 tiles and count labels with integer math."""
+    logits = logits.reshape(-1, logits.shape[-1])
+    labels = labels.reshape(-1)
+    valid = labels != -100
+    if mask is not None:
+        valid &= mask.reshape(-1).bool()
+    count = int(valid.sum().item())
+    total = torch.zeros((), dtype=torch.float64, device=logits.device)
+    for start in range(0, labels.numel(), chunk_size):
+        end = min(start + chunk_size, labels.numel())
+        tile_labels = labels[start:end].masked_fill(~valid[start:end], -100)
+        tile_nll = torch.nn.functional.cross_entropy(
+            logits[start:end].float(), tile_labels, reduction="sum", ignore_index=-100,
+        )
+        total += tile_nll.to(torch.float64)
+    if not torch.isfinite(total):
+        raise RuntimeError("Model produced non-finite next-token loss")
+    return total, count
+
+
 def _kld_cache_manifest(testenc, nsamples, seqlen, stride, vocab_size, metadata):
     input_ids = testenc.detach().to(device="cpu", dtype=torch.long)
     used_ids = input_ids[:, :nsamples * seqlen].contiguous()
     positions_per_window = len(range(0, seqlen - 1, stride))
     return {
-        "schema": 1,
+        "schema": 2,
         "metric": "full_vocab_kl_sampled_positions",
         "dataset": "Salesforce/wikitext:wikitext-2-raw-v1:test",
         "context_length": int(seqlen),
@@ -99,6 +119,8 @@ def evaluate_ppl(
     if hasattr(testenc, 'input_ids'):
         testenc = testenc.input_ids
     seqlen = getattr(model, 'seqlen', model.config.max_position_embeddings)
+    if seqlen < 2 or testenc.ndim != 2 or testenc.shape[0] != 1:
+        raise ValueError("PPL requires one 2D token stream and a context length of at least 2")
     print(f"Using sequence length: {seqlen} (model max: {model.config.max_position_embeddings})")
     nsamples = testenc.numel() // seqlen
 
@@ -106,10 +128,8 @@ def evaluate_ppl(
     use_bos_stride = "gemma" in model.config.model_type.lower()
     bos_tensor = None
     effective_seqlen = seqlen
-    nll_seqlen = seqlen - 1
     if use_bos_stride:
         effective_seqlen -= 1  # Reserve one position for BOS token
-        nll_seqlen += 1
         bos_tensor = torch.tensor([[model.generation_config.bos_token_id]], device=model.device)
         print("Inject bos_token_id for Gemma model")
 
@@ -147,7 +167,8 @@ def evaluate_ppl(
         kld_per_position = None
         kld_positions_per_window = 0
 
-    nlls = []
+    total_nll = torch.zeros((), device=dev, dtype=torch.float64)
+    total_tokens = 0
     # Create a custom progress bar to show cumulative PPL
     if verbose:
         pbar = tqdm(range(nsamples), desc=f"Evaluating PPL for {dataset_name} (PPL: N/A)", disable=not verbose)
@@ -167,8 +188,7 @@ def evaluate_ppl(
 
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = batch[:, 1:].contiguous()
-        loss_fct = nn.CrossEntropyLoss()
-        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        batch_nll, batch_tokens = _next_token_nll(shift_logits, shift_labels)
 
         if kld_role == "candidate" or (kld_role == "reference" and not kld_cache_hit):
             sampled_positions = torch.arange(
@@ -196,18 +216,21 @@ def evaluate_ppl(
                 per_position_kl = (
                     reference_log_probs.exp() * (reference_log_probs - sampled_log_probs)
                 ).sum(dim=-1).clamp_min_(0.0)
+                if not torch.isfinite(per_position_kl).all():
+                    raise RuntimeError("Model produced non-finite KL divergence")
                 kld_per_position.append(per_position_kl.cpu().numpy())
 
-        neg_log_likelihood = loss.float() * nll_seqlen
-
-        nlls.append(neg_log_likelihood)
+        total_nll += batch_nll
+        total_tokens += batch_tokens
 
         # Update progress bar with current PPL
-        if verbose and len(nlls) > 0:
-            current_ppl = torch.exp(torch.stack(nlls).sum() / (len(nlls) * nll_seqlen))
+        if verbose and total_tokens > 0:
+            current_ppl = torch.exp(total_nll / total_tokens)
             pbar.set_description(f"Evaluating PPL for {dataset_name} (PPL: {current_ppl.item():.4f})")
 
-    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * nll_seqlen))
+    if total_tokens == 0:
+        raise ValueError(f"No valid next-token labels found in {dataset_name}")
+    ppl = torch.exp(total_nll / total_tokens)
 
     if verbose:
         print(f"Perplexity on {dataset_name}: {ppl.item():.4f}")
@@ -249,7 +272,6 @@ def evaluate_ppl_on_windows(model, dataset, dev, dataset_name, verbose=True):
     """Evaluate PPL on independent token windows without joining their boundaries."""
     model.eval().to(dev)
     seqlen = getattr(model, 'seqlen', model.config.max_position_embeddings)
-    loss_fct = nn.CrossEntropyLoss(reduction="none")
     total_nll = torch.zeros((), dtype=torch.float64, device=dev)
     total_tokens = 0
 
@@ -281,18 +303,13 @@ def evaluate_ppl_on_windows(model, dataset, dev, dataset_name, verbose=True):
 
         shift_logits = outputs.logits[:, :-1, :].contiguous()
         shift_labels = input_ids[:, 1:].contiguous()
-        token_nll = loss_fct(
-            shift_logits.reshape(-1, shift_logits.size(-1)),
-            shift_labels.reshape(-1),
-        )
-
-        if attention_mask is not None:
-            loss_mask = attention_mask[:, 1:].reshape(-1).to(token_nll.dtype)
-            total_nll += (token_nll * loss_mask).sum().to(torch.float64)
-            total_tokens += int(loss_mask.sum().item())
-        else:
-            total_nll += token_nll.sum().to(torch.float64)
-            total_tokens += shift_labels.numel()
+        # The predictor AND its following target must be real tokens. This
+        # excludes the pad -> first-token transition for left-padded windows.
+        loss_mask = (attention_mask[:, :-1].bool() & attention_mask[:, 1:].bool()
+                     if attention_mask is not None else None)
+        window_nll, window_tokens = _next_token_nll(shift_logits, shift_labels, loss_mask)
+        total_nll += window_nll
+        total_tokens += window_tokens
 
         if verbose and (index + 1) % 8 == 0 and total_tokens:
             pbar.set_postfix(ppl=f"{torch.exp(total_nll / total_tokens).item():.4f}")
@@ -338,6 +355,7 @@ def evaluate_model(
     kld_cache_dir=None,
     kld_sample_stride=64,
     kld_metadata=None,
+    seed=0,
 ):
     """
     Main function to comprehensively evaluate a final model on PPL and/or zero-shot tasks.
@@ -413,6 +431,7 @@ def evaluate_model(
                 pretrained=model,
                 tokenizer=tokenizer,
                 batch_size=batch_size,
+                max_length=model.seqlen,
             )
             harness_results = simple_evaluate(
                 model=lm,
@@ -420,6 +439,10 @@ def evaluate_model(
                 num_fewshot=num_fewshot,
                 limit=None if limit == -1 else limit,
                 log_samples=False,
+                random_seed=getattr(args, "seed", seed),
+                numpy_random_seed=getattr(args, "seed", seed),
+                torch_random_seed=getattr(args, "seed", seed),
+                fewshot_random_seed=getattr(args, "seed", seed),
             )
             results.update(harness_results["results"])
 
