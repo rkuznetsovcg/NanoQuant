@@ -55,10 +55,14 @@ def _batch_kwargs(kwargs, batch_size, device=None, pin_memory=False, host_refs=N
             if value.ndim and value.shape[0] == 1 and batch_size > 1:
                 value = value.expand(batch_size, *value.shape[1:])
             if (pin_memory and device is not None and torch.device(device).type == "cuda"
-                    and value.device.type == "cpu" and not value.is_pinned()):
-                value = value.pin_memory()
-                if host_refs is not None:
-                    host_refs.append(value)
+                    and value.device.type == "cpu"):
+                if not value.is_pinned() or not value.is_contiguous():
+                    # Singleton kwargs may have been expanded with stride-zero
+                    # views above. pin_memory() rejects tensors with overlapping
+                    # storage, so materialize a contiguous host batch first.
+                    value = value.contiguous().pin_memory()
+                    if host_refs is not None:
+                        host_refs.append(value)
             return value.to(device=device, non_blocking=True) if device is not None else value
         elif isinstance(value, dict):
             return {key: expand(item) for key, item in value.items()}
