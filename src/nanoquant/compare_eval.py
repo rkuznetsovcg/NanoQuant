@@ -8,6 +8,7 @@ import datetime
 import gc
 import hashlib
 import json
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -72,7 +73,80 @@ def _validate_results(
         raise RuntimeError(f"{label} evaluation did not produce required metrics: {', '.join(missing)}")
 
 
-def _evaluate_one(label, model_factory, tokenizer_factory, protocol, output_path, state, kld_cache_dir):
+def _recover_bf16_results_from_log(
+    log_path: Path,
+    ppl_datasets: list[str],
+    expected_revision: str,
+) -> dict | None:
+    """Recover completed baseline metrics when an older evaluator failed after logging them."""
+    if not log_path or not log_path.is_file():
+        return None
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    bf16_start = log_text.find("===== bf16: загрузка модели =====")
+    if bf16_start < 0:
+        return None
+    nanoquant_start = log_text.find("===== nanoquant:", bf16_start + 1)
+    bf16_log = log_text[bf16_start:nanoquant_start] if nanoquant_start >= 0 else log_text[bf16_start:]
+    revision_match = re.search(r"Ревизия модели:\s*([0-9a-f]{40,64})", log_text[:bf16_start])
+    if not revision_match or revision_match.group(1) != expected_revision:
+        return None
+
+    recovered = {}
+    for dataset in ppl_datasets:
+        if dataset.lower() in {"calibration", "calib"}:
+            match = re.search(
+                r"Perplexity on calibration set \(in-sample\):\s*([0-9.eE+-]+)\s*"
+                r"\((\d+) predicted tokens\)",
+                bf16_log,
+            )
+            windows_match = re.search(
+                r"Evaluating PPL on calibration set \(in-sample\):\s*(\d+) windows",
+                bf16_log,
+            )
+            if not match or not windows_match:
+                return None
+            recovered["calibration_in_sample"] = {
+                "ppl": float(match.group(1)),
+                "windows": int(windows_match.group(1)),
+                "predicted_tokens": int(match.group(2)),
+            }
+            continue
+
+        match = re.search(
+            rf"Perplexity on {re.escape(dataset)}:\s*([0-9.eE+-]+)",
+            bf16_log,
+        )
+        if not match:
+            return None
+        recovered[dataset] = {"ppl": float(match.group(1))}
+
+    marker = "Zero-shot tasks results:"
+    marker_index = bf16_log.rfind(marker)
+    if marker_index < 0:
+        return None
+    json_start = bf16_log.find("{", marker_index + len(marker))
+    if json_start < 0:
+        return None
+    try:
+        task_results, _ = json.JSONDecoder().raw_decode(bf16_log[json_start:])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(task_results, dict):
+        return None
+    recovered.update(task_results)
+    return recovered
+
+
+def _evaluate_one(
+    label,
+    model_factory,
+    tokenizer_factory,
+    protocol,
+    output_path,
+    state,
+    kld_cache_dir,
+    kld_only=False,
+):
     print(f"\n===== {label}: загрузка модели =====", flush=True)
     model = model_factory()
     try:
@@ -81,15 +155,17 @@ def _evaluate_one(label, model_factory, tokenizer_factory, protocol, output_path
         model.seqlen = protocol["sequence_length"]
         model.eval()
         print(
-            f"===== {label}: PPL {protocol['ppl_datasets']} и задачи {protocol['zero_shot_tasks']} =====",
+            f"===== {label}: PPL "
+            f"{['wikitext2'] if kld_only else protocol['ppl_datasets']} и задачи "
+            f"{[] if kld_only else protocol['zero_shot_tasks']} =====",
             flush=True,
         )
         set_seed(protocol["seed"])
-        results = evaluate_model(
+        evaluated_results = evaluate_model(
             model=model,
             tokenizer=tokenizer,
-            tasks_str=",".join(protocol["zero_shot_tasks"]),
-            eval_ppl=",".join(protocol["ppl_datasets"]),
+            tasks_str="" if kld_only else ",".join(protocol["zero_shot_tasks"]),
+            eval_ppl="wikitext2" if kld_only else ",".join(protocol["ppl_datasets"]),
             num_fewshot=protocol["num_fewshot"],
             limit=protocol["limit"],
             batch_size=protocol["batch_size"],
@@ -102,6 +178,8 @@ def _evaluate_one(label, model_factory, tokenizer_factory, protocol, output_path
                 "base_model_revision": protocol["model_revision"],
             },
         )
+        results = dict(state["results"].get(label, {})) if kld_only else {}
+        results.update(evaluated_results)
         _validate_results(
             results,
             protocol["ppl_datasets"],
@@ -176,6 +254,11 @@ def main():
     parser.add_argument("--output", required=True, help="Paired comparison JSON output")
     parser.add_argument("--revision", default=None, help="Pinned Hugging Face model commit")
     parser.add_argument("--revision-source", default="provided", help="How the model revision was selected")
+    parser.add_argument(
+        "--resume-log",
+        default=None,
+        help="Previous comparison log from which a completed BF16 evaluation may be recovered",
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config).resolve()
@@ -267,18 +350,26 @@ def main():
             state["results"] = previous.get("results", {})
             print("Совпадающий предыдущий результат найден; уже готовая модель будет пропущена.", flush=True)
 
+    if "bf16" not in state["results"] and args.resume_log:
+        recovered = _recover_bf16_results_from_log(
+            Path(args.resume_log), ppl_datasets, expected_revision=source_revision,
+        )
+        if recovered is not None:
+            try:
+                _validate_results(recovered, ppl_datasets, task_names, "BF16 recovered from log")
+            except RuntimeError as error:
+                print(f"Не удалось безопасно восстановить BF16 из лога: {error}", flush=True)
+            else:
+                state["results"]["bf16"] = recovered
+                _write_json(output_path, state)
+                print(
+                    "Восстановил законченные BF16-метрики из предыдущего лога; "
+                    "zero-shot повторно запускать не нужно.",
+                    flush=True,
+                )
+
     cache_key = hashlib.sha256(str(output_path).encode("utf-8")).hexdigest()[:20]
     kld_cache_dir = Path(tempfile.gettempdir()) / "nanoquant-paired-kld" / cache_key
-    bf16_kld_manifest = kld_cache_dir / "manifest.json"
-    bf16_kld_values = kld_cache_dir / "bf16_log_probs.npy"
-    if (
-        "bf16" in state["results"]
-        and "nanoquant" not in state["results"]
-        and not (bf16_kld_manifest.is_file() and bf16_kld_values.is_file())
-    ):
-        state["results"].pop("bf16")
-        print("Локальный KL-кэш BF16 отсутствует; пересчитаю BF16 перед NanoQuant.", flush=True)
-
     required_fast_attention = bool(profile.get("require_fast_linear_attention", False))
     backend = protocol["attention_backend"]
 
@@ -319,7 +410,14 @@ def main():
         _evaluate_one("bf16", evaluate_bf16, tokenizer_factory, protocol, output_path, state, kld_cache_dir)
     else:
         _validate_results(state["results"]["bf16"], ppl_datasets, task_names, "bf16 cached")
-        print("===== BF16: использую сохранённые результаты =====", flush=True)
+        if "nanoquant" not in state["results"]:
+            print("BF16-метрики уже готовы; проверяю или восстанавливаю KL-кэш коротким WikiText-проходом.", flush=True)
+            _evaluate_one(
+                "bf16", evaluate_bf16, tokenizer_factory, protocol, output_path, state, kld_cache_dir,
+                kld_only=True,
+            )
+        else:
+            print("===== BF16: использую сохранённые результаты =====", flush=True)
 
     if "nanoquant" not in state["results"]:
         _evaluate_one("nanoquant", evaluate_nanoquant, tokenizer_factory, protocol, output_path, state, kld_cache_dir)
