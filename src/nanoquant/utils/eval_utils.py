@@ -1,17 +1,90 @@
 # Copyright (c) 2026 Samsung Electronics Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
 import json
+import shutil
+from pathlib import Path
 
 import torch.nn as nn
 import torch
+import numpy as np
 from lm_eval.evaluator import simple_evaluate
 from lm_eval.models.huggingface import HFLM
 from tqdm import tqdm
 
 
+def _kld_cache_manifest(testenc, nsamples, seqlen, stride, vocab_size, metadata):
+    input_ids = testenc.detach().to(device="cpu", dtype=torch.long)
+    used_ids = input_ids[:, :nsamples * seqlen].contiguous()
+    positions_per_window = len(range(0, seqlen - 1, stride))
+    return {
+        "schema": 1,
+        "metric": "full_vocab_kl_sampled_positions",
+        "dataset": "Salesforce/wikitext:wikitext-2-raw-v1:test",
+        "context_length": int(seqlen),
+        "sample_stride": int(stride),
+        "windows": int(nsamples),
+        "predicted_positions": int(nsamples * positions_per_window),
+        "positions_per_window": int(positions_per_window),
+        "vocab_size": int(vocab_size),
+        "input_ids_sha256": hashlib.sha256(used_ids.numpy().tobytes()).hexdigest(),
+        **(metadata or {}),
+    }
+
+
+def _open_kld_reference_cache(cache_dir, manifest, mode):
+    cache_dir = Path(cache_dir)
+    manifest_path = cache_dir / "manifest.json"
+    log_probs_path = cache_dir / "bf16_log_probs.npy"
+    shape = (manifest["predicted_positions"], manifest["vocab_size"])
+
+    existing_is_valid = False
+    if manifest_path.is_file() and log_probs_path.is_file():
+        try:
+            existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            existing_array = np.load(log_probs_path, mmap_mode="r")
+            existing_is_valid = existing_manifest == manifest and existing_array.shape == shape
+        except (OSError, ValueError, json.JSONDecodeError):
+            existing_is_valid = False
+
+    if mode == "candidate":
+        if not existing_is_valid:
+            raise RuntimeError(
+                "BF16 KL reference cache is missing or does not match this evaluation. "
+                "Re-run the paired evaluation so BF16 can rebuild it."
+            )
+        return np.load(log_probs_path, mmap_mode="r"), True
+
+    if existing_is_valid:
+        return np.load(log_probs_path, mmap_mode="r+"), True
+
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    log_probs = np.lib.format.open_memmap(
+        log_probs_path,
+        mode="w+",
+        dtype=np.float32,
+        shape=shape,
+    )
+    return log_probs, False
+
+
 @torch.no_grad()
-def evaluate_ppl(model, testenc, dev, dataset_name, args=None, verbose=True):
+def evaluate_ppl(
+    model,
+    testenc,
+    dev,
+    dataset_name,
+    args=None,
+    verbose=True,
+    kld_role=None,
+    kld_cache_dir=None,
+    kld_sample_stride=64,
+    kld_metadata=None,
+    kld_result=None,
+):
     """
     Core helper function for calculating Perplexity (PPL).
     This function contains the actual PPL calculation logic and is called by other evaluation functions.
@@ -48,6 +121,32 @@ def evaluate_ppl(model, testenc, dev, dataset_name, args=None, verbose=True):
             print(f"Not enough data for PPL evaluation on {dataset_name} with seqlen {seqlen}. Skipping.")
         return None
 
+    if kld_role not in (None, "reference", "candidate"):
+        raise ValueError("kld_role must be 'reference', 'candidate', or None")
+    if kld_role is not None:
+        if kld_cache_dir is None:
+            raise ValueError("kld_cache_dir is required when computing paired KL")
+        if kld_sample_stride < 1:
+            raise ValueError("kld_sample_stride must be at least 1")
+        vocab_size = getattr(model.config, "vocab_size", None)
+        if vocab_size is None and hasattr(model.config, "text_config"):
+            vocab_size = getattr(model.config.text_config, "vocab_size", None)
+        if vocab_size is None:
+            raise ValueError("Could not determine model vocabulary size for KL evaluation")
+        kld_manifest = _kld_cache_manifest(
+            testenc, nsamples, seqlen, kld_sample_stride, vocab_size, kld_metadata,
+        )
+        kld_cache, kld_cache_hit = _open_kld_reference_cache(
+            kld_cache_dir, kld_manifest, kld_role,
+        )
+        kld_per_position = []
+        kld_positions_per_window = kld_manifest["positions_per_window"]
+    else:
+        kld_cache = None
+        kld_cache_hit = False
+        kld_per_position = None
+        kld_positions_per_window = 0
+
     nlls = []
     # Create a custom progress bar to show cumulative PPL
     if verbose:
@@ -71,6 +170,34 @@ def evaluate_ppl(model, testenc, dev, dataset_name, args=None, verbose=True):
         loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
+        if kld_role == "candidate" or (kld_role == "reference" and not kld_cache_hit):
+            sampled_positions = torch.arange(
+                0, shift_logits.shape[1], kld_sample_stride, device=shift_logits.device,
+            )
+            sampled_logits = shift_logits[0].index_select(0, sampled_positions).float()
+            sampled_log_probs = torch.nn.functional.log_softmax(sampled_logits, dim=-1)
+            if sampled_log_probs.shape != (
+                kld_positions_per_window, kld_manifest["vocab_size"],
+            ):
+                raise RuntimeError(
+                    "Sampled model logits do not match the KL cache shape: "
+                    f"{tuple(sampled_log_probs.shape)} vs "
+                    f"({kld_positions_per_window}, {kld_manifest['vocab_size']})"
+                )
+            row_start = i * kld_positions_per_window
+            row_end = row_start + kld_positions_per_window
+
+            if kld_role == "reference":
+                kld_cache[row_start:row_end] = sampled_log_probs.cpu().numpy()
+            else:
+                reference_log_probs = torch.from_numpy(
+                    np.array(kld_cache[row_start:row_end], copy=True)
+                ).to(device=sampled_log_probs.device)
+                per_position_kl = (
+                    reference_log_probs.exp() * (reference_log_probs - sampled_log_probs)
+                ).sum(dim=-1).clamp_min_(0.0)
+                kld_per_position.append(per_position_kl.cpu().numpy())
+
         neg_log_likelihood = loss.float() * nll_seqlen
 
         nlls.append(neg_log_likelihood)
@@ -84,6 +211,35 @@ def evaluate_ppl(model, testenc, dev, dataset_name, args=None, verbose=True):
 
     if verbose:
         print(f"Perplexity on {dataset_name}: {ppl.item():.4f}")
+
+    if kld_role == "reference" and not kld_cache_hit:
+        kld_cache.flush()
+        manifest_path = Path(kld_cache_dir) / "manifest.json"
+        temporary_manifest = manifest_path.with_suffix(".json.tmp")
+        temporary_manifest.write_text(
+            json.dumps(kld_manifest, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        temporary_manifest.replace(manifest_path)
+
+    if kld_role == "candidate":
+        if not kld_per_position:
+            raise RuntimeError("KL evaluation produced no sampled token positions")
+        all_positions = np.concatenate(kld_per_position)
+        metric = {
+            "direction": "BF16 || NanoQuant",
+            "variant": "full-vocabulary KL on a systematic position sample",
+            "mean_nats_per_token": float(all_positions.mean()),
+            "median_nats_per_token": float(np.median(all_positions)),
+            "p90_nats_per_token": float(np.percentile(all_positions, 90)),
+            "p99_nats_per_token": float(np.percentile(all_positions, 99)),
+            "predicted_positions": int(all_positions.size),
+            "context_length": int(seqlen),
+            "position_stride": int(kld_sample_stride),
+            "lower_is_closer_to_bf16": True,
+        }
+        if kld_result is not None:
+            kld_result.update(metric)
 
     return ppl.item()
 
@@ -178,6 +334,10 @@ def evaluate_model(
     batch_size=1,
     args=None,
     calibration_dataset_path=None,
+    kld_role=None,
+    kld_cache_dir=None,
+    kld_sample_stride=64,
+    kld_metadata=None,
 ):
     """
     Main function to comprehensively evaluate a final model on PPL and/or zero-shot tasks.
@@ -218,11 +378,29 @@ def evaluate_model(
                     seqlen=model.seqlen,
                     tokenizer=tokenizer,
                 )
-                ppl_result = evaluate_ppl(model, testloader, device, dataset, args, verbose=True)
+                kld_result = {}
+                apply_kld = dataset.lower() == "wikitext2" and kld_role is not None
+                ppl_result = evaluate_ppl(
+                    model,
+                    testloader,
+                    device,
+                    dataset,
+                    args,
+                    verbose=True,
+                    kld_role=kld_role if apply_kld else None,
+                    kld_cache_dir=kld_cache_dir if apply_kld else None,
+                    kld_sample_stride=kld_sample_stride,
+                    kld_metadata=kld_metadata,
+                    kld_result=kld_result,
+                )
                 if ppl_result is not None:
                     results[dataset] = {"ppl": ppl_result}
+                if kld_result:
+                    results["wikitext2_kld_full_vocab"] = kld_result
             except Exception as e:
                 print(f"Failed to evaluate PPL on dataset {dataset}: {e}")
+                if dataset.lower() == "wikitext2" and kld_role is not None:
+                    raise
                 continue
 
     # Zero-shot Task Evaluation

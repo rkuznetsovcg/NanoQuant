@@ -6,7 +6,10 @@
 import argparse
 import datetime
 import gc
+import hashlib
 import json
+import shutil
+import tempfile
 from pathlib import Path
 from numbers import Real
 from statistics import mean
@@ -45,7 +48,13 @@ def _primary_accuracy(task_result: dict):
     return None, None
 
 
-def _validate_results(results: dict, ppl_datasets: list[str], task_names: list[str], label: str) -> None:
+def _validate_results(
+    results: dict,
+    ppl_datasets: list[str],
+    task_names: list[str],
+    label: str,
+    require_kld: bool = False,
+) -> None:
     missing = []
     for dataset in ppl_datasets:
         key = "calibration_in_sample" if dataset.lower() in {"calibration", "calib"} else dataset
@@ -55,11 +64,13 @@ def _validate_results(results: dict, ppl_datasets: list[str], task_names: list[s
         task_result = results.get(task)
         if not isinstance(task_result, dict) or _primary_accuracy(task_result)[1] is None:
             missing.append(f"zero-shot:{task}")
+    if require_kld and not isinstance(results.get("wikitext2_kld_full_vocab"), dict):
+        missing.append("KL:WikiText-2 full vocabulary")
     if missing:
         raise RuntimeError(f"{label} evaluation did not produce required metrics: {', '.join(missing)}")
 
 
-def _evaluate_one(label, model_factory, tokenizer_factory, protocol, output_path, state):
+def _evaluate_one(label, model_factory, tokenizer_factory, protocol, output_path, state, kld_cache_dir):
     print(f"\n===== {label}: загрузка модели =====", flush=True)
     model = model_factory()
     try:
@@ -81,8 +92,21 @@ def _evaluate_one(label, model_factory, tokenizer_factory, protocol, output_path
             limit=protocol["limit"],
             batch_size=protocol["batch_size"],
             calibration_dataset_path=protocol["calibration_dataset"],
+            kld_role="reference" if label == "bf16" else "candidate",
+            kld_cache_dir=str(kld_cache_dir),
+            kld_sample_stride=protocol["kl_divergence"]["position_stride"],
+            kld_metadata={
+                "base_model_id": protocol["model_id"],
+                "base_model_revision": protocol["model_revision"],
+            },
         )
-        _validate_results(results, protocol["ppl_datasets"], protocol["zero_shot_tasks"], label)
+        _validate_results(
+            results,
+            protocol["ppl_datasets"],
+            protocol["zero_shot_tasks"],
+            label,
+            require_kld=label == "nanoquant",
+        )
         state["results"][label] = results
         _write_json(output_path, state)
         print(f"===== {label}: оценка завершена =====", flush=True)
@@ -129,6 +153,14 @@ def _build_comparison(results: dict, task_names: list[str]) -> dict:
 
     return {
         "perplexity": ppl_comparison,
+        "kl_divergence": {
+            "wikitext2": {
+                **quantized["wikitext2_kld_full_vocab"],
+                "dataset": "WikiText-2 raw test",
+                "reference_model": "BF16",
+                "candidate_model": "NanoQuant",
+            },
+        },
         "zero_shot": task_comparison,
         "mean_zero_shot_delta_percentage_points": mean(deltas) if deltas else None,
     }
@@ -179,6 +211,8 @@ def main():
     if not calibration_path.is_dir():
         raise FileNotFoundError(f"Calibration dataset not found: {calibration_path}")
     ppl_datasets = [item.strip() for item in profile.get("ppl_task", "wikitext2,calibration").split(",") if item.strip()]
+    if not any(dataset.lower() == "wikitext2" for dataset in ppl_datasets):
+        ppl_datasets.insert(0, "wikitext2")
     task_names = [
         item.strip()
         for item in profile.get(
@@ -198,6 +232,14 @@ def main():
         "dtype": "bfloat16",
         "attention_backend": profile.get("attn_implementation", "auto"),
         "ppl_datasets": ppl_datasets,
+        "kl_divergence": {
+            "metric": "full_vocab_next_token_kl",
+            "direction": "KL(p_BF16 || p_NanoQuant)",
+            "dataset": "WikiText-2 raw test",
+            "context_length": int(profile.get("seqlen", 2048)),
+            "position_stride": 64,
+            "reported_unit": "nats_per_token",
+        },
         "zero_shot_tasks": task_names,
         "num_fewshot": int(profile.get("num_fewshot", 0)),
         "limit": int(profile.get("limit", -1)),
@@ -222,6 +264,18 @@ def main():
         if previous.get("protocol") == protocol:
             state["results"] = previous.get("results", {})
             print("Совпадающий предыдущий результат найден; уже готовая модель будет пропущена.", flush=True)
+
+    cache_key = hashlib.sha256(str(output_path).encode("utf-8")).hexdigest()[:20]
+    kld_cache_dir = Path(tempfile.gettempdir()) / "nanoquant-paired-kld" / cache_key
+    bf16_kld_manifest = kld_cache_dir / "manifest.json"
+    bf16_kld_values = kld_cache_dir / "bf16_log_probs.npy"
+    if (
+        "bf16" in state["results"]
+        and "nanoquant" not in state["results"]
+        and not (bf16_kld_manifest.is_file() and bf16_kld_values.is_file())
+    ):
+        state["results"].pop("bf16")
+        print("Локальный KL-кэш BF16 отсутствует; пересчитаю BF16 перед NanoQuant.", flush=True)
 
     required_fast_attention = bool(profile.get("require_fast_linear_attention", False))
     backend = protocol["attention_backend"]
@@ -260,27 +314,38 @@ def main():
         return model.cuda()
 
     if "bf16" not in state["results"]:
-        _evaluate_one("bf16", evaluate_bf16, tokenizer_factory, protocol, output_path, state)
+        _evaluate_one("bf16", evaluate_bf16, tokenizer_factory, protocol, output_path, state, kld_cache_dir)
     else:
         _validate_results(state["results"]["bf16"], ppl_datasets, task_names, "bf16 cached")
         print("===== BF16: использую сохранённые результаты =====", flush=True)
 
     if "nanoquant" not in state["results"]:
-        _evaluate_one("nanoquant", evaluate_nanoquant, tokenizer_factory, protocol, output_path, state)
+        _evaluate_one("nanoquant", evaluate_nanoquant, tokenizer_factory, protocol, output_path, state, kld_cache_dir)
     else:
-        _validate_results(state["results"]["nanoquant"], ppl_datasets, task_names, "nanoquant cached")
+        _validate_results(
+            state["results"]["nanoquant"], ppl_datasets, task_names, "nanoquant cached", require_kld=True,
+        )
         print("===== NanoQuant: использую сохранённые результаты =====", flush=True)
 
     state["comparison"] = _build_comparison(state["results"], task_names)
     state["status"] = "complete"
     state["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     _write_json(output_path, state)
+    shutil.rmtree(kld_cache_dir, ignore_errors=True)
 
     print("\n===== BF16 → NanoQuant: разницы =====", flush=True)
     for dataset, values in state["comparison"]["perplexity"].items():
         print(
             f"{dataset}: {values['bf16']:.4f} → {values['nanoquant']:.4f} PPL "
             f"({values['delta_nanoquant_minus_bf16']:+.4f}; {values['relative_change_percent']:+.2f}%)",
+            flush=True,
+        )
+    for dataset, values in state["comparison"]["kl_divergence"].items():
+        print(
+            f"KL {dataset} ({values['direction']}): {values['mean_nats_per_token']:.6g} nats/token "
+            f"(median {values['median_nats_per_token']:.6g}; "
+            f"p90 {values['p90_nats_per_token']:.6g}; "
+            f"n={values['predicted_positions']})",
             flush=True,
         )
     for task, values in state["comparison"]["zero_shot"].items():
