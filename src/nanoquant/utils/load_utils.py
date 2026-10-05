@@ -240,6 +240,13 @@ def cache_inputs_and_kwargs(model, dataloader, dev):
         model.model.decoder.embed_positions.to(dev)
     else:
         model.model.embed_tokens.to(dev)
+        # Qwen3.5/3.8 computes rotary embeddings before entering the first
+        # decoder block. Keep its inverse-frequency buffers beside the CUDA
+        # input embeddings while Catcher captures that block's inputs.
+        for name in ("rotary_emb", "rotary_emb_local"):
+            rotary = getattr(model.model, name, None)
+            if rotary is not None:
+                rotary.to(dev)
     layers[0].to(dev)
 
     cache = {
