@@ -41,10 +41,12 @@ def _json_default(value):
 
 
 def _primary_accuracy(task_result: dict):
-    for key in ("acc_norm", "acc"):
-        value = task_result.get(key)
-        if isinstance(value, Real):
-            return key, float(value)
+    for metric_name in ("acc_norm", "acc"):
+        for key, value in task_result.items():
+            # Recent lm-eval versions qualify metric keys with the aggregation,
+            # e.g. "acc_norm,none"; older versions may return the bare name.
+            if (key == metric_name or key.startswith(metric_name + ",")) and isinstance(value, Real):
+                return key, float(value)
     return None, None
 
 
