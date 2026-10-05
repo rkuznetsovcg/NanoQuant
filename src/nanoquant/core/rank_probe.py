@@ -7,7 +7,8 @@ import torch.nn.functional as F
 
 from .admm_nq import factorize_admm_nanoquant
 from .resume import _atomic_save, content_key
-from ..utils.utils import find_layers, rank_allocation_importance, set_seed
+from ..utils.utils import (find_layers, rank_allocation_bounds, rank_allocation_importance,
+                           set_seed, uniform_rank_for_shape)
 
 
 def packed_bits(module, rank, num_scales=2):
@@ -135,12 +136,19 @@ def refine_block_ranks(block, names, block_index, ranks, config):
         module = modules[name]
         rank = initial[name]
         cap = min(module.in_features, module.out_features)
-        probe_ranks = sorted({max(min(32, cap), min(cap, 32*int(rank*multiplier/32)))
-                              for multiplier in (0.6, 1.0, 1.4)} | {rank})
-        settings = {"version": 1, "iterations": iterations, "inner": config["admm_inner_iters"],
+        uniform_rank = uniform_rank_for_shape(
+            module.in_features, module.out_features, config["bits"], num_scales=2)
+        min_rank, max_rank = rank_allocation_bounds(
+            uniform_rank, cap,
+            float(config.get("rank_allocation_min_uniform_ratio", 0.75)),
+            float(config.get("rank_allocation_max_uniform_ratio", 1.25)))
+        probe_ranks = sorted({max(min_rank, min(max_rank, 32*int(uniform_rank*multiplier/32)))
+                              for multiplier in (0.75, 1.0, 1.25)} | {rank})
+        settings = {"version": 2, "iterations": iterations, "inner": config["admm_inner_iters"],
                     "warm": config.get("admm_warm_start_iters", 2), "reg": config["admm_reg"],
                     "scheduler": config["admm_penalty_scheduler"], "seed": config["seed"],
-                    "ranks": probe_ranks, "metric": "initial-diagonal", "dtype": str(module.weight.dtype)}
+                    "ranks": probe_ranks, "metric": "initial-diagonal", "dtype": str(module.weight.dtype),
+                    "rank_bounds": [min_rank, max_rank]}
         path = cache_dir / (content_key((module.weight, module.i_norm, module.o_norm), settings)+".pt") if cache_dir else None
         if path is not None and path.exists():
             probes = torch.load(path, weights_only=True)

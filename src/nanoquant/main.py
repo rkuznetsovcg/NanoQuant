@@ -84,6 +84,8 @@ class TuneArguments:
     refresh_input_stats: bool = field(default=True, metadata={"help": 'Refresh clipped diagonal inputs after each TuneFP'})
     resume_dir: str = field(default="", metadata={"help": 'Local directory for atomic block resume and cached rank probes'})
     rank_budget: str = field(default="nominal", metadata={"help": 'Rank budget: nominal bits or parity with rounded uniform ranks'})
+    rank_allocation_min_uniform_ratio: float = field(default=0.75, metadata={"help": 'Minimum adaptive rank as a fraction of the analytical uniform rank'})
+    rank_allocation_max_uniform_ratio: float = field(default=1.25, metadata={"help": 'Maximum adaptive rank as a multiple of the analytical uniform rank'})
     rank_probe_candidates: int = field(default=0, metadata={"help": 'Maximum measured rank candidates per block; 0 keeps the cheap proxy'})
     rank_probe_iters: int = field(default=50, metadata={"help": 'ADMM iterations per rank probe'})
     correlation_block_size: int = field(default=0, metadata={"help": 'Input covariance channel blocks: 0, 128 or 256'})
@@ -204,6 +206,8 @@ def main():
         refresh_input_stats=tune_args.refresh_input_stats,
         resume_dir=tune_args.resume_dir,
         rank_budget=tune_args.rank_budget,
+        rank_allocation_min_uniform_ratio=tune_args.rank_allocation_min_uniform_ratio,
+        rank_allocation_max_uniform_ratio=tune_args.rank_allocation_max_uniform_ratio,
         rank_probe_candidates=tune_args.rank_probe_candidates,
         rank_probe_iters=tune_args.rank_probe_iters,
         correlation_block_size=tune_args.correlation_block_size,

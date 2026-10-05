@@ -1,4 +1,5 @@
 """Sequential reconstruction and bounded, current-input curvature capture."""
+import math
 from collections import OrderedDict
 
 import torch
@@ -191,6 +192,11 @@ def validate_reconstruction_config(config):
         raise ValueError("rank_allocation must be sensitivity, kronq_trace or uniform")
     if config.get("rank_budget", "nominal") not in {"nominal", "uniform"}:
         raise ValueError("rank_budget must be nominal or uniform")
+    min_uniform_ratio = float(config.get("rank_allocation_min_uniform_ratio", 0.75))
+    max_uniform_ratio = float(config.get("rank_allocation_max_uniform_ratio", 1.25))
+    if (not math.isfinite(min_uniform_ratio) or not math.isfinite(max_uniform_ratio)
+            or not 0 < min_uniform_ratio <= 1 <= max_uniform_ratio):
+        raise ValueError("Adaptive rank ratios must satisfy 0 < min <= 1 <= max")
     size = config.get("correlation_block_size", 0)
     if size not in {0, 128, 256}:
         raise ValueError("correlation_block_size must be 0, 128 or 256")

@@ -105,6 +105,8 @@ class NanoQuantConfigDataclass:
     refresh_input_stats: bool = True
     resume_dir: str = ""
     rank_budget: str = "nominal"
+    rank_allocation_min_uniform_ratio: float = 0.75
+    rank_allocation_max_uniform_ratio: float = 1.25
     rank_probe_candidates: int = 0
     rank_probe_iters: int = 50
     correlation_block_size: int = 0

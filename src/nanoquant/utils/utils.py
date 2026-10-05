@@ -249,50 +249,41 @@ def rank_allocation_importance(module, rank_allocation="sensitivity"):
     return max(weighted_energy, 0.0)
 
 
+def uniform_rank_for_shape(a, b, bits, num_scales=2):
+    """Return the existing analytical rank baseline for one linear layer."""
+    cap = min(a, b)
+    min_rank = min(32, cap)
+    if cap <= 0 or bits is None or a * b == 0:
+        return min_rank
+
+    total_budget_bits = a * b * bits
+    parameter_sum = a + b
+    if num_scales == 3:
+        raw_rank = (total_budget_bits - 16 * parameter_sum) / (parameter_sum + 16)
+    else:
+        raw_rank = (total_budget_bits / parameter_sum) - 16
+    rank = (int(raw_rank) // 32) * 32
+    if rank <= 0:
+        rank = min_rank
+    return min(cap, max(rank, min_rank))
+
+
+def rank_allocation_bounds(uniform_rank, cap, min_ratio=0.75, max_ratio=1.25):
+    """Bound adaptive ranks around the analytical uniform rank in 32-wide steps."""
+    lower = max(min(32, cap), math.ceil(uniform_rank * min_ratio / 32) * 32)
+    upper = min(cap, math.floor(uniform_rank * max_ratio / 32) * 32)
+    # Keep the baseline reachable when a small matrix or 32-rank granularity
+    # would otherwise round one side of the interval past it.
+    return min(lower, uniform_rank), max(upper, uniform_rank)
+
+
 def calculate_ranks(model, layers_to_analyze, quant_config):
     """
     Unified entry point for bit allocation.
     """
-    def _get_rank(a, b, bits, num_scales=2):
-        """
-        Estimates split_dim based on bit target, accounting for scale overhead.
-
-        Standard (2 scales: pre, post):
-            Total Bits = Paths * [ Rank * (a + b) + 16 * (a + b) ]
-        DBF (3 scales: pre, mid, post):
-            Total Bits = Paths * [ Rank * (a + b) + 16 * (a + b + Rank) ]
-        """
-        if bits is None or a * b == 0:
-            return None
-
-        total_budget_bits = a * b * bits
-        param_sum = a + b
-
-        if num_scales == 3:
-            # Rank = (Budget - 16*(a+b)) / (a+b+16)
-            return (total_budget_bits - 16 * param_sum) / (param_sum + 16)
-        else:
-            # Standard: Rank = (Budget / (a+b)) - 16
-            return (total_budget_bits / param_sum) - 16
-
-    def _finalize_rank(rank, min_rank):
-        curr_rank = int(rank) if rank is not None else 0
-        curr_rank = (curr_rank // 32) * 32
-        if curr_rank == 0:
-            curr_rank = min_rank
-        return max(curr_rank, min_rank)
-
-    def _validate_rank(rank, in_features, out_features):
-        """Validate that rank is reasonable for layer dimensions."""
-        if rank <= 0:
-            return max(min(in_features, out_features) // 32, 32)
-        if rank > min(in_features, out_features):
-            return min(in_features, out_features)
-        return rank
-
     # Use a stable, model-wide uniform baseline unless a caller opts into an
-    # experimental sensitivity allocator. The unconstrained global allocator
-    # can spend nearly the entire rank budget in early decoder layers.
+    # adaptive allocator. Adaptive scores may reorder budget within this band,
+    # but cannot starve late layers or saturate a few early ones.
     rank_allocation = quant_config.get("rank_allocation", "uniform")
     if rank_allocation not in {"sensitivity", "kronq_trace", "uniform"}:
         raise ValueError(
@@ -306,6 +297,10 @@ def calculate_ranks(model, layers_to_analyze, quant_config):
     num_scales = 3 if quant_config['admm_type'] == 'dbf' else 2
     bits = quant_config['bits']
     print(f"Rank calculation: Bits = ({bits:.2f}), Scales: {num_scales}, Allocation: {rank_allocation}")
+    min_ratio = float(quant_config.get("rank_allocation_min_uniform_ratio", 0.75))
+    max_ratio = float(quant_config.get("rank_allocation_max_uniform_ratio", 1.25))
+    if rank_allocation != "uniform":
+        print(f"Adaptive rank bounds: {min_ratio:.2f}–{max_ratio:.2f}× uniform rank per linear")
     ranks = {}
     specs = []
     storage_layers = []
@@ -315,21 +310,21 @@ def calculate_ranks(model, layers_to_analyze, quant_config):
             if name in subset:
                 lx = subset[name]
                 a, b = lx.in_features, lx.out_features
-                rank = _get_rank(a, b, bits, num_scales)
-                final_rank = _finalize_rank(rank, 32)
-                final_rank = _validate_rank(final_rank, lx.in_features, lx.out_features)
+                final_rank = uniform_rank_for_shape(a, b, bits, num_scales)
                 key = f"{i}.{name}"
                 storage_layers.append((key, lx))
                 if rank_allocation == "uniform":
                     ranks[key] = final_rank
                     continue
 
+                min_rank, max_rank = rank_allocation_bounds(
+                    final_rank, min(a, b), min_ratio, max_ratio)
                 specs.append({
                     "key": key,
                     "a": a,
                     "b": b,
-                    "rank": min(32, min(a, b)),
-                    "max_rank": min(a, b),
+                    "rank": min_rank,
+                    "max_rank": max_rank,
                     "uniform_rank": final_rank,
                     "importance": rank_allocation_importance(lx, rank_allocation),
                 })
