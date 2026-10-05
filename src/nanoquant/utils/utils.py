@@ -290,7 +290,10 @@ def calculate_ranks(model, layers_to_analyze, quant_config):
             return min(in_features, out_features)
         return rank
 
-    rank_allocation = quant_config.get("rank_allocation", "sensitivity")
+    # Use a stable, model-wide uniform baseline unless a caller opts into an
+    # experimental sensitivity allocator. The unconstrained global allocator
+    # can spend nearly the entire rank budget in early decoder layers.
+    rank_allocation = quant_config.get("rank_allocation", "uniform")
     if rank_allocation not in {"sensitivity", "kronq_trace", "uniform"}:
         raise ValueError(
             f"Unsupported rank_allocation={rank_allocation!r}; "

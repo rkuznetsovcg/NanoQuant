@@ -89,7 +89,7 @@ class NanoQuantConfigDataclass:
     eval_after_each_block: bool = False
     admm_warm_start_iters: int = 2
     log_reconstruction_error: bool = False
-    rank_allocation: str = "sensitivity"
+    rank_allocation: str = "uniform"
     admm_early_stop: bool = True
     admm_min_outer_iters: int = 120
     admm_check_interval: int = 10

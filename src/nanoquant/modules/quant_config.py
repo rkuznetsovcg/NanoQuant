@@ -54,7 +54,7 @@ def NanoQuantConfig(
     admm_rho_stop_threshold: float = 0.85,
     model_kd_vocab_chunk_size: int = 4096,
     model_kd_pack_factors: bool = False,
-    rank_allocation: str = "sensitivity",
+    rank_allocation: str = "uniform",
     require_fast_linear_attention: bool = False,
     attn_implementation: str = "auto",
     tune_schedule: str = "sequential",

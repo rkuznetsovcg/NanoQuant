@@ -187,7 +187,7 @@ def refresh_input_stats(block, linears, inputs, kwargs, batch_size, shrinkage=0.
 
 def validate_reconstruction_config(config):
     reconstruction_groups([], config.get("tune_schedule", "sequential"))
-    if config.get("rank_allocation", "sensitivity") not in {"sensitivity", "kronq_trace", "uniform"}:
+    if config.get("rank_allocation", "uniform") not in {"sensitivity", "kronq_trace", "uniform"}:
         raise ValueError("rank_allocation must be sensitivity, kronq_trace or uniform")
     if config.get("rank_budget", "nominal") not in {"nominal", "uniform"}:
         raise ValueError("rank_budget must be nominal or uniform")

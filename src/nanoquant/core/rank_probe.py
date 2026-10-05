@@ -108,7 +108,7 @@ def refine_block_ranks(block, names, block_index, ranks, config):
     initial = {name: ranks[f"{block_index}.{name}"] for name in modules}
     # Choose candidates with the largest proxy marginal return. The default
     # cheap allocator still covers all other weights.
-    allocation = config.get("rank_allocation", "sensitivity")
+    allocation = config.get("rank_allocation", "uniform")
     if allocation == "uniform":
         # Preserve the historical probe-candidate ordering for uniform ranks.
         allocation = "sensitivity"
