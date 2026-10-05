@@ -1,0 +1,16 @@
+{
+  "finished_utc": "2026-10-05T14:12:52.926664+00:00",
+  "model_id": "Qwen/Qwen3.8-27B",
+  "profile": "configs/qwen38-0.55-balanced.json",
+  "bits": 0.55,
+  "calibration_windows": 128,
+  "sequence_length": 2048,
+  "attention_backend": "sdpa",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "gpu_vram_gib": 94.97,
+  "pytorch": "2.11.0+cu130",
+  "cuda_runtime": "13.0",
+  "nanoquant_commit": "7c3f2a627a928da0624fd93d03391ecc0bd63c22",
+  "checkpoint_file": "Qwen3.8-27B-NQ-0.55-balanced.pt",
+  "checkpoint_size_bytes": 6766192305
+}
