@@ -56,11 +56,12 @@ class AutoNQModel():
             model_id, quant_config['seqlen'], device_map=device_map,
             require_fast_linear_attention=quant_config.get('require_fast_linear_attention', False),
             attn_implementation=quant_config.get('attn_implementation', 'auto'),
+            revision=quant_config.get('model_revision'),
         )
 
         # load dataloader
         data = prepare_dataset(model_id, quant_config)
-        tokenizer = load_tokenizer(model_id)
+        tokenizer = load_tokenizer(model_id, revision=quant_config.get('model_revision'))
         dataloader = get_calib_loader(data, tokenizer, quant_config['num_calib_samples'], quant_config['seed'],
                                       quant_config['seqlen'])
 
@@ -84,7 +85,8 @@ class AutoNQModel():
         return load_compressed_model(model_name_or_path=model_id, checkpoint_path=qmodel_path,
                                      seqlen=quant_config['seqlen'], has_mid_scale=(quant_config['admm_type'] == 'dbf'),
                                      device=device_map, dtype=dtype,
-                                     attn_implementation=quant_config.get('attn_implementation', 'auto'))
+                                     attn_implementation=quant_config.get('attn_implementation', 'auto'),
+                                     revision=quant_config.get('model_revision'))
 
     def save_model(self, model, qmodel_path):
         """

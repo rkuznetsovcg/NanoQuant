@@ -89,7 +89,7 @@ def _check_flashqla_backend(config):
 
 
 def load_model(model_id, seqlen=2048, device_map="cpu", require_fast_linear_attention=False,
-               attn_implementation="auto"):
+               attn_implementation="auto", revision=None, print_model=True):
     """
     Loads a pretrained model from the Hugging Face Hub and resizes positional embeddings if needed.
     
@@ -105,7 +105,7 @@ def load_model(model_id, seqlen=2048, device_map="cpu", require_fast_linear_atte
     # load model from huggingface
     print(f"Loading model '{model_id}'...")
 
-    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True, revision=revision)
     if "mobilellm" in model_id.lower():  # have to adjust config for mobilellm, to enable lm_head
         config.share_embedding = False
     _check_fast_linear_attention(config, required=require_fast_linear_attention)
@@ -116,15 +116,18 @@ def load_model(model_id, seqlen=2048, device_map="cpu", require_fast_linear_atte
         # Default: load to CPU for calibration and training
         model = AutoModelForCausalLM.from_pretrained(model_id, config=config, dtype=torch.bfloat16,
                                                      attn_implementation=attention_backend, low_cpu_mem_usage=True,
-                                                     trust_remote_code=True, device_map={'': 'cpu'})
+                                                     trust_remote_code=True, device_map={'': 'cpu'}, revision=revision)
     else:
         # For large models: load with specified device_map (e.g., "auto" for GPU+CPU offloading)
         model = AutoModelForCausalLM.from_pretrained(model_id, config=config, dtype=torch.bfloat16,
                                                      attn_implementation=attention_backend, low_cpu_mem_usage=True,
                                                      trust_remote_code=True, device_map=device_map,
-                                                     max_memory={0: '80GiB'})
+                                                     max_memory={0: '80GiB'}, revision=revision)
 
-    print(model)
+    if print_model:
+        print(model)
+    else:
+        print(f"Loaded base model: {type(model).__name__} ({model.config.model_type})")
 
     if model.config.model_type in {"qwen3_5", "qwen3_5_text"}:
         print(
@@ -181,15 +184,19 @@ def load_model(model_id, seqlen=2048, device_map="cpu", require_fast_linear_atte
     return model
 
 
-def load_tokenizer(model_name):
+def load_tokenizer(model_name, revision=None):
     """
     Returns the tokenizer.
     """
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name, use_fast=True, trust_remote_code=True, revision=revision,
+        )
     except (OSError, TypeError, ValueError):
-        tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, trust_remote_code=True)
-    gen_cfg = GenerationConfig.from_pretrained(model_name)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name, use_fast=False, trust_remote_code=True, revision=revision,
+        )
+    gen_cfg = GenerationConfig.from_pretrained(model_name, revision=revision)
 
     def resolve_id(token_id):
         return token_id if isinstance(token_id, int) else token_id[0]
@@ -383,10 +390,12 @@ def _load_and_process_state_dict(checkpoint_path: str, dtype: torch.dtype) -> Di
 
 
 def load_compressed_model(model_name_or_path: str, checkpoint_path: str, seqlen: int, device: str, has_mid_scale=False,
-                          dtype=torch.bfloat16, attn_implementation="auto"):
+                          dtype=torch.bfloat16, attn_implementation="auto", revision=None):
     t0 = time.time()
     print(f"INFO: Loading model config from '{model_name_or_path}' and weights from '{checkpoint_path}'.")
-    config = AutoConfig.from_pretrained(model_name_or_path)
+    config = AutoConfig.from_pretrained(
+        model_name_or_path, trust_remote_code=True, revision=revision,
+    )
     config._attn_implementation = resolve_attention_backend(
         config, attn_implementation, execution_device=device, dtype=dtype,
     )

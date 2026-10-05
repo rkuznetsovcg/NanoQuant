@@ -211,7 +211,12 @@ def evaluate_model(
                     continue
 
                 from ..utils.data_utils import get_test_loaders
-                _, testloader = get_test_loaders(dataset, model_name=model.config._name_or_path, seqlen=model.seqlen)
+                _, testloader = get_test_loaders(
+                    dataset,
+                    model_name=model.config._name_or_path,
+                    seqlen=model.seqlen,
+                    tokenizer=tokenizer,
+                )
                 ppl_result = evaluate_ppl(model, testloader, device, dataset, args, verbose=True)
                 if ppl_result is not None:
                     results[dataset] = {"ppl": ppl_result}

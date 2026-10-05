@@ -112,6 +112,7 @@ class NanoQuantConfigDataclass:
     nonfact_plateau_tolerance: float = 0.0
     nonfact_plateau_min_epochs: int = 3
     nonfact_plateau_patience: int = 2
+    model_revision: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -314,6 +315,8 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
 
         # 4. Final overwrite with kwargs provided directly by the user (highest priority)
         for k, v in nanoquant_kwargs.items():
+            if k == "model_revision" and v is None:
+                continue
             setattr(config, k, v)
 
         # Load model using existing infrastructure
@@ -324,12 +327,14 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
             model = load_compressed_model(model_name_or_path=config.model_id, checkpoint_path=local_path,
                                           seqlen=config.seqlen, device=device_map,
                                           has_mid_scale=(config.admm_type == 'dbf'), dtype=dtype,
-                                          attn_implementation=config.attn_implementation)
+                                          attn_implementation=config.attn_implementation,
+                                          revision=config.model_revision)
         else:
             # This is likely a base model, load normally
             model = load_model(config.model_id, config.seqlen, device_map=device_map,
                                require_fast_linear_attention=config.require_fast_linear_attention,
-                               attn_implementation=config.attn_implementation)
+                               attn_implementation=config.attn_implementation,
+                               revision=config.model_revision)
             model = model.to(dtype)
 
         # Load base model info (Optional)
@@ -372,11 +377,12 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
             model_id, quant_dict['seqlen'], device_map=device_map,
             require_fast_linear_attention=quant_dict.get('require_fast_linear_attention', False),
             attn_implementation=quant_dict.get('attn_implementation', 'auto'),
+            revision=quant_dict.get('model_revision'),
         )
 
         # Load dataloader
         data = prepare_dataset(model_id, quant_dict)
-        tokenizer = load_tokenizer(model_id)
+        tokenizer = load_tokenizer(model_id, revision=quant_dict.get('model_revision'))
         dataloader = get_calib_loader(data, tokenizer, quant_dict['num_calib_samples'], quant_dict['seed'],
                                       quant_dict['seqlen'])
 
@@ -478,7 +484,8 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
         model = load_compressed_model(model_name_or_path=quant_dict['model_id'], checkpoint_path=qmodel_path,
                                       seqlen=quant_dict['seqlen'], has_mid_scale=(quant_dict['admm_type'] == 'dbf'),
                                       device=device_map, dtype=dtype,
-                                      attn_implementation=quant_dict.get('attn_implementation', 'auto'))
+                                      attn_implementation=quant_dict.get('attn_implementation', 'auto'),
+                                      revision=quant_dict.get('model_revision'))
         return cls(model, quant_config, base_model_id=quant_dict['model_id'])
 
     @classmethod

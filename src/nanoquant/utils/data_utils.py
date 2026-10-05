@@ -56,11 +56,12 @@ def get_calib_loader(dataset_path, tokenizer, n_samples=128, seed=0, seqlen=2048
     return dataloader
 
 
-def get_test_loaders(name, seqlen=2048, model_name=''):
+def get_test_loaders(name, seqlen=2048, model_name='', tokenizer=None):
     """
     Loads standard evaluation datasets like Wikitext2 and C4.
     """
-    tokenizer = load_tokenizer(model_name)
+    if tokenizer is None:
+        tokenizer = load_tokenizer(model_name)
 
     if 'wikitext2' in name:
         # Correct dataset name to 'wikitext' and config to 'wikitext-2-raw-v1'
@@ -222,7 +223,7 @@ def prepare_dataset(model_id, quant_config):
     calib_data_type = quant_config['calib_dataset']
     assert calib_data_type in ['wikitext2', 'c4']
 
-    tokenizer = load_tokenizer(model_id)
+    tokenizer = load_tokenizer(model_id, revision=quant_config.get('model_revision'))
 
     # Use a list of Nones if no configs are provided
     dataset_name = "Salesforce/wikitext" if "wikitext2" == calib_data_type else "allenai/c4"

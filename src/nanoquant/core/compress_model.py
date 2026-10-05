@@ -474,7 +474,8 @@ def compress_model_recon(model, fp_model, dataloader, quant_config, dev="cuda"):
                 quant_config['model_id'], quant_config['seqlen'],
                 device_map=quant_config.get('device_map', 'cpu'),
                 require_fast_linear_attention=quant_config.get('require_fast_linear_attention', False),
-                attn_implementation=quant_config.get('attn_implementation', 'auto'))
+                attn_implementation=quant_config.get('attn_implementation', 'auto'),
+                revision=quant_config.get('model_revision'))
         fp_model.eval()
         teacher_hidden_cache = _compute_teacher_hidden_cache(
             fp_model=fp_model, dataloader=dataloader, num_samples=model_kd_num_samples,

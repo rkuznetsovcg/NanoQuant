@@ -54,6 +54,7 @@ class ModelArguments:
         metadata={"help": "Full-attention backend (BF16 forward/backward; FA4 is explicit)",
                   "choices": ["auto", "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4"]},
     )
+    model_revision: Optional[str] = field(default=None, metadata={"help": "Pinned Hugging Face model revision"})
 
 
 @dataclass
@@ -185,6 +186,7 @@ def main():
     # Merge into NanoQuantConfigDataclass
     quant_config = NanoQuantConfigDataclass(
         model_id=model_args.model_id,
+        model_revision=model_args.model_revision,
         bits=quant_args.bits,
         rank_allocation=quant_args.rank_allocation,
         seed=quant_args.seed,
@@ -248,6 +250,7 @@ def main():
         nanoquant_model = NanoQuantModel.from_pretrained(
             hub_id, dtype=torch.bfloat16, device_map="cuda",
             attn_implementation=model_args.attn_implementation,
+            model_revision=model_args.model_revision,
         )
         loaded_from_hub = True
     else:
@@ -272,7 +275,7 @@ def main():
     if not loaded_from_hub:
         model = model.cuda()
 
-    tokenizer = load_tokenizer(model_args.model_id)
+    tokenizer = load_tokenizer(model_args.model_id, revision=model_args.model_revision)
 
     try:
         results = evaluate_model(

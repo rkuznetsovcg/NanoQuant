@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Samsung Electronics Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Optional
+
 def NanoQuantConfig(
     # model id
     model_id: str = "meta-llama/Llama-2-7b-hf",
@@ -67,10 +69,12 @@ def NanoQuantConfig(
     nonfact_plateau_tolerance: float = 0.0,
     nonfact_plateau_min_epochs: int = 3,
     nonfact_plateau_patience: int = 2,
+    model_revision: Optional[str] = None,
 ) -> dict:
     return {
         # model id
         "model_id": model_id,
+        "model_revision": model_revision,
         # quant precision
         "bits": bits,
         "rank_allocation": rank_allocation,
