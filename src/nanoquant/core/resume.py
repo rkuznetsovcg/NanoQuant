@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from ..modules.linear import NanoQuantLinear
+from .linearized_block import LinearizedDecoderBlock
 from ..utils.utils import get_decoder_layers
 
 
@@ -66,12 +67,19 @@ class BlockCheckpoint:
     def __init__(self, model, tokens, config, reference_model=None):
         self.directory = Path(config["resume_dir"]) if config.get("resume_dir") else None
         self.manifest = None
+        self.linearize_block_index = config.get("linearize_block_index")
         self.total_blocks = len(get_decoder_layers(model))
         if self.directory is None:
             return
         self.directory.mkdir(parents=True, exist_ok=True)
         settings = {key: value for key, value in config.items()
                     if key not in {"resume_dir", "eval_after_each_block"}}
+        # Keep old baseline manifests resumable when the optional pilot is off.
+        # These controls had no effect in earlier versions and remain inert
+        # unless a block index is explicitly selected.
+        if config.get("linearize_block_index") is None:
+            for key in ("linearize_block_index", "linearize_max_tokens", "linearize_chunk_tokens", "linearize_ridge"):
+                settings.pop(key, None)
         settings["model_config"] = model.config.to_dict()
         digest = hashlib.sha256(json.dumps(settings, sort_keys=True, default=str).encode())
         update_tensor_digest(digest, tokens)
@@ -94,12 +102,22 @@ class BlockCheckpoint:
             return None
         blocks = get_decoder_layers(model)
         initial = torch.load(self.directory / "initial.pt", map_location="cpu", weights_only=True)
+        completed_blocks = self.manifest["completed_blocks"]
+        if self.linearize_block_index is not None and int(self.linearize_block_index) < completed_blocks:
+            index = int(self.linearize_block_index)
+            if index >= len(blocks):
+                raise ValueError(f"Resumed linearized block index {index} is outside the model depth")
+            text_config = getattr(model.config, "text_config", model.config)
+            parameter = next(blocks[index].parameters(), None)
+            device = parameter.device if parameter is not None else torch.device("cpu")
+            dtype = parameter.dtype if parameter is not None else torch.bfloat16
+            blocks[index] = LinearizedDecoderBlock(int(text_config.hidden_size), device=device, dtype=dtype)
         for name, module in model.named_modules():
             if name in initial["stats"]:
                 i_norm, o_norm = initial["stats"][name]
                 module.register_buffer("i_norm", i_norm, persistent=False)
                 module.register_buffer("o_norm", o_norm, persistent=False)
-        for index in range(self.manifest["completed_blocks"]):
+        for index in range(completed_blocks):
             payload = torch.load(self.directory / f"block-{index:04d}.pt", map_location="cpu", weights_only=True)
             modules = dict(blocks[index].named_modules())
             for name, metadata in payload["linears"].items():
@@ -119,7 +137,7 @@ class BlockCheckpoint:
             for device_index in range(torch.cuda.device_count()):
                 torch.cuda.set_rng_state(saved_cuda[min(device_index, len(saved_cuda)-1)], device_index)
         snapshot["ranks"] = initial["ranks"] | snapshot["ranks"]
-        print(f"Resuming after {self.manifest['completed_blocks']} completed decoder blocks")
+        print(f"Resuming after {completed_blocks} completed decoder blocks")
         return snapshot
 
     def initialize(self, model, ranks, original_inputs, compressed_inputs, kwargs):

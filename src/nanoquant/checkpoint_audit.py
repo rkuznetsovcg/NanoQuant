@@ -8,6 +8,9 @@ from pathlib import Path
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
 
+from .core.linearized_block import LINEARIZED_BLOCK_INDICES_KEY, LinearizedDecoderBlock
+from .utils.utils import get_decoder_layers
+
 
 def _shape(state, key, errors):
     packed_key = key + "_packed"
@@ -45,6 +48,28 @@ def audit_state_dict(state, template, target_bits=0.55, progress=False):
     errors, warnings, layers = [], [], []
     if not isinstance(state, dict):
         raise TypeError("The checkpoint must contain a state_dict dictionary")
+    linearized_indices = []
+    linearized_metadata = state.pop(LINEARIZED_BLOCK_INDICES_KEY, None)
+    if linearized_metadata is not None:
+        if (not isinstance(linearized_metadata, torch.Tensor) or linearized_metadata.ndim != 1
+                or linearized_metadata.dtype not in (torch.int32, torch.int64)):
+            errors.append("Invalid linearized block index metadata")
+        else:
+            linearized_indices = [int(index) for index in linearized_metadata.tolist()]
+            if len(linearized_indices) != len(set(linearized_indices)):
+                errors.append("Duplicate linearized block indices")
+            if getattr(template.config, "model_type", None) not in {"qwen3_5", "qwen3_5_text"}:
+                errors.append("Linearized block metadata is unsupported for this model architecture")
+            else:
+                blocks = get_decoder_layers(template)
+                text_config = getattr(template.config, "text_config", template.config)
+                for index in linearized_indices:
+                    if index < 0 or index >= len(blocks):
+                        errors.append(f"Linearized block index {index} is outside the model depth")
+                        continue
+                    blocks[index] = LinearizedDecoderBlock(
+                        int(text_config.hidden_size), device="meta", dtype=torch.bfloat16,
+                    )
     expected = {key: tuple(tensor.shape) for key, tensor in template.state_dict().items()}
     embedding = getattr(template, "get_input_embeddings", lambda: None)()
     embedding_key = next((f"{name}.weight" for name, module in template.named_modules() if module is embedding), None)
@@ -125,6 +150,7 @@ def audit_state_dict(state, template, target_bits=0.55, progress=False):
     selected_elements = sum(layer["original_elements"] for layer in layers)
     return {"status": "invalid" if errors else "valid_format", "errors": errors, "warnings": warnings,
             "quantized_linear_count": len(layers), "layers": layers,
+            "linearized_block_indices": linearized_indices,
             "selected_linears_bpw": 8*sum(layer["stored_bytes"] for layer in layers)/max(1, selected_elements),
             "tensor_storage_gib": sum(value.numel()*value.element_size() for value in state.values()
                                       if isinstance(value, torch.Tensor))/2**30,

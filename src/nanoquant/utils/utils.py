@@ -169,7 +169,7 @@ def get_decoder_layer_cls_name(model: nn.Module) -> List[str]:
     return []
 
 
-def estimate_weight_storage(model, planned_layers, num_scales=2):
+def estimate_weight_storage(model, planned_layers, num_scales=2, linearized_block_indices=None):
     """Estimate weight bytes from shapes without reading or copying tensors.
 
     planned_layers contains (linear_module, rank) pairs before replacement.
@@ -177,15 +177,36 @@ def estimate_weight_storage(model, planned_layers, num_scales=2):
     are excluded. Unchanged tied parameters are counted once.
     """
     selected_modules = {id(module) for module, _rank in planned_layers}
+    linearized_block_indices = set(linearized_block_indices or ())
+    excluded_parameters = set()
+    replacement_bytes = 0
+    replacement_elements = 0
+    if linearized_block_indices:
+        blocks = get_decoder_layers(model)
+        text_config = getattr(model.config, "text_config", model.config)
+        hidden_size = int(text_config.hidden_size)
+        for index in linearized_block_indices:
+            if index < 0 or index >= len(blocks):
+                raise ValueError(f"linearized block index {index} is outside the model depth")
+            block = blocks[index]
+            excluded_parameters.update(id(parameter) for parameter in block.parameters())
+            block_parameter = next(block.parameters(), None)
+            element_size = block_parameter.element_size() if block_parameter is not None else 2
+            block_replacement_elements = hidden_size * hidden_size + hidden_size
+            replacement_elements += block_replacement_elements
+            replacement_bytes += block_replacement_elements * element_size
     remaining_parameters = {}
     for module in model.modules():
         for name, parameter in module.named_parameters(recurse=False):
+            if id(parameter) in excluded_parameters:
+                continue
             if id(module) in selected_modules and name == "weight":
                 continue
             remaining_parameters[id(parameter)] = parameter
     remaining_bytes = sum(parameter.numel() * parameter.element_size()
-                          for parameter in remaining_parameters.values())
-    original_elements = sum(parameter.numel() for parameter in model.parameters())
+                          for parameter in remaining_parameters.values()) + replacement_bytes
+    original_elements = sum(parameter.numel() for parameter in model.parameters()
+                            if id(parameter) not in excluded_parameters) + replacement_elements
     selected_elements = 0
     packed_bytes = 0
     unpacked_bytes = 0
@@ -304,7 +325,14 @@ def calculate_ranks(model, layers_to_analyze, quant_config):
     ranks = {}
     specs = []
     storage_layers = []
+    linearized_block_indices = set()
+    linearized_index = quant_config.get("linearize_block_index")
+    if linearized_index is not None:
+        linearized_block_indices.add(int(linearized_index))
+        print(f"Linearized-block pilot: excluding decoder block {linearized_index} from the rank budget")
     for i, layer in enumerate(get_decoder_layers(model)):
+        if i in linearized_block_indices:
+            continue
         subset = find_layers(layer)
         for name in layers_to_analyze:
             if name in subset:
@@ -373,7 +401,12 @@ def calculate_ranks(model, layers_to_analyze, quant_config):
         for item in specs:
             ranks[item["key"]] = item["rank"]
 
-    storage = estimate_weight_storage(model, [(module, ranks[key]) for key, module in storage_layers], num_scales)
+    storage = estimate_weight_storage(
+        model,
+        [(module, ranks[key]) for key, module in storage_layers],
+        num_scales,
+        linearized_block_indices=linearized_block_indices,
+    )
     print(
         f"Weight storage estimate: selected linears {storage['selected_bpw']:.3f} bpw; "
         f"whole model {storage['whole_model_bpw']:.3f} bpw; "

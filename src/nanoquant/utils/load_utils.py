@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer, GenerationConfig)
 
+from ..core.linearized_block import LINEARIZED_BLOCK_INDICES_KEY, LinearizedDecoderBlock
 from ..kernel.utils import binary_unpacker
 from ..utils.utils import cleanup_memory, get_decoder_layers
 from .attention_utils import resolve_attention_backend
@@ -312,7 +313,12 @@ def get_compressed_state_dict(model: nn.Module):
             raise ValueError(f"Cannot export unfinished training factors in {name}; finalize them first")
     # Recursive state_dict invokes NanoQuantLinear's packer and retains every
     # persistent buffer and tied alias. Calibration buffers are nonpersistent.
-    return model.state_dict()
+    state_dict = model.state_dict()
+    linearized_indices = [index for index, block in enumerate(get_decoder_layers(model))
+                          if isinstance(block, LinearizedDecoderBlock)]
+    if linearized_indices:
+        state_dict[LINEARIZED_BLOCK_INDICES_KEY] = torch.tensor(linearized_indices, dtype=torch.int32)
+    return state_dict
 
 
 def _load_and_process_state_dict(checkpoint_path: str, dtype: torch.dtype) -> Dict[str, Any]:
@@ -320,22 +326,41 @@ def _load_and_process_state_dict(checkpoint_path: str, dtype: torch.dtype) -> Di
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Could not find model weights at {checkpoint_path}")
 
-    # torch.load with best-effort fast/safe options (mmap/weights_only when available)
-    sig = inspect.signature(torch.load)
-    kwargs = {"map_location": "cpu"}
-    if "mmap" in sig.parameters:
-        kwargs["mmap"] = True  # faster / lower peak RAM
-    if "weights_only" in sig.parameters:
-        kwargs["weights_only"] = True  # default True since 2.6 when pickle_module not passed
-
-    try:
-        sd = torch.load(checkpoint_path, **kwargs)
-    except Exception:
-        if kwargs.get("weights_only", False):
-            kwargs["weights_only"] = False  # ONLY if you trust the checkpoint
-            sd = torch.load(checkpoint_path, **kwargs)
+    checkpoint_file = Path(checkpoint_path)
+    if checkpoint_file.is_dir():
+        safetensors_path = checkpoint_file / "model.safetensors"
+        pytorch_path = checkpoint_file / "model_state.pt"
+        if safetensors_path.is_file():
+            try:
+                from safetensors.torch import load_file
+            except ImportError as error:
+                raise ImportError("Loading this NanoQuant directory requires safetensors") from error
+            sd = load_file(str(safetensors_path), device="cpu")
+            checkpoint_file = None
+        elif pytorch_path.is_file():
+            checkpoint_file = pytorch_path
         else:
-            raise
+            raise FileNotFoundError(
+                f"No model.safetensors or model_state.pt found in NanoQuant directory {checkpoint_path}"
+            )
+
+    # torch.load with best-effort fast/safe options (mmap/weights_only when available)
+    if checkpoint_file is not None:
+        sig = inspect.signature(torch.load)
+        kwargs = {"map_location": "cpu"}
+        if "mmap" in sig.parameters:
+            kwargs["mmap"] = True  # faster / lower peak RAM
+        if "weights_only" in sig.parameters:
+            kwargs["weights_only"] = True  # default True since 2.6 when pickle_module not passed
+
+        try:
+            sd = torch.load(checkpoint_file, **kwargs)
+        except Exception:
+            if kwargs.get("weights_only", False):
+                kwargs["weights_only"] = False  # ONLY if you trust the checkpoint
+                sd = torch.load(checkpoint_file, **kwargs)
+            else:
+                raise
 
     if not isinstance(sd, dict):
         raise TypeError(f"Expected a state_dict dict from {checkpoint_path}, got {type(sd)}")
@@ -404,6 +429,30 @@ def load_compressed_model(model_name_or_path: str, checkpoint_path: str, seqlen:
             model = AutoModelForCausalLM.from_config(config)
 
     sd = _load_and_process_state_dict(checkpoint_path, dtype)
+    linearized_indices = sd.pop(LINEARIZED_BLOCK_INDICES_KEY, None)
+    if linearized_indices is not None:
+        indices = [int(index) for index in linearized_indices.tolist()]
+        if len(indices) != len(set(indices)):
+            raise ValueError("Checkpoint contains duplicate linearized decoder block indices")
+        if config.model_type not in {"qwen3_5", "qwen3_5_text"}:
+            raise ValueError("Checkpoint contains a linearized-block pilot unsupported by this model architecture")
+
+    def install_linearized_blocks(target_model):
+        if linearized_indices is None:
+            return
+        blocks = get_decoder_layers(target_model)
+        text_config = getattr(config, "text_config", config)
+        for index in indices:
+            if index < 0 or index >= len(blocks):
+                raise ValueError(f"Checkpoint linearized block index {index} is outside the model depth")
+            parameter = next(blocks[index].parameters(), None)
+            block_device = parameter.device if parameter is not None else torch.device("meta")
+            block_dtype = parameter.dtype if parameter is not None else dtype
+            blocks[index] = LinearizedDecoderBlock(
+                int(text_config.hidden_size), device=block_device, dtype=block_dtype,
+            )
+
+    install_linearized_blocks(model)
 
     def convert_layers(m: nn.Module):
         from ..modules.linear import NanoQuantLinear
@@ -429,6 +478,7 @@ def load_compressed_model(model_name_or_path: str, checkpoint_path: str, seqlen:
         except TypeError:
             # assign=True unsupported -> guaranteed fallback path
             model = AutoModelForCausalLM.from_config(config)
+            install_linearized_blocks(model)
             convert_layers(model)
             incompatible = model.load_state_dict(sd, strict=False)
             meta_init = False

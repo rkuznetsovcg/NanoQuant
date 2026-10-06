@@ -188,6 +188,16 @@ def refresh_input_stats(block, linears, inputs, kwargs, batch_size, shrinkage=0.
 
 def validate_reconstruction_config(config):
     reconstruction_groups([], config.get("tune_schedule", "sequential"))
+    linearize_index = config.get("linearize_block_index")
+    if linearize_index is not None and int(linearize_index) < 0:
+        raise ValueError("linearize_block_index must be nonnegative or null")
+    if int(config.get("linearize_max_tokens", 16384)) < 2:
+        raise ValueError("linearize_max_tokens must be at least 2")
+    if int(config.get("linearize_chunk_tokens", 1024)) < 1:
+        raise ValueError("linearize_chunk_tokens must be positive")
+    linearize_ridge = float(config.get("linearize_ridge", 1e-4))
+    if not math.isfinite(linearize_ridge) or linearize_ridge < 0:
+        raise ValueError("linearize_ridge must be finite and nonnegative")
     if config.get("rank_allocation", "uniform") not in {"sensitivity", "kronq_trace", "uniform"}:
         raise ValueError("rank_allocation must be sensitivity, kronq_trace or uniform")
     if config.get("rank_budget", "nominal") not in {"nominal", "uniform"}:

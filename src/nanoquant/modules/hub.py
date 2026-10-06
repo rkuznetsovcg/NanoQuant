@@ -115,6 +115,11 @@ class NanoQuantConfigDataclass:
     nonfact_plateau_min_epochs: int = 3
     nonfact_plateau_patience: int = 2
     model_revision: Optional[str] = None
+    # Optional one-block linear approximation pilot; None keeps baseline intact.
+    linearize_block_index: Optional[int] = None
+    linearize_max_tokens: int = 16384
+    linearize_chunk_tokens: int = 1024
+    linearize_ridge: float = 1e-4
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -245,7 +250,7 @@ class NanoQuantModel(nn.Module, PyTorchModelHubMixin):
                 from safetensors.torch import save_file
 
                 # Create a minimal index file for single-shard model
-                weight_map = {key: "model.safetensors" for key in self.model.state_dict().keys()}
+                weight_map = {key: "model.safetensors" for key in state_dict.keys()}
                 with open(index_file, "w") as f:
                     json.dump(
                         {

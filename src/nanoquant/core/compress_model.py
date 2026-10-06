@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 from ..optimi import AdamW
 from ..core.compress_block import (factorize_and_replace, tune_fact, tune_nonfact)
+from .linearized_block import fit_linearized_decoder_block
 from ..modules.linear import NanoQuantLinear
 from .reconstruction_plan import reconstruction_groups, refresh_input_stats, shared_input_key, validate_reconstruction_config, stage_quant_config
 from .resume import BlockCheckpoint, _atomic_save, content_key
@@ -16,7 +17,7 @@ from .rank_probe import refine_block_ranks
 from ..utils.eval_utils import evaluate_ppl_after_block
 from ..utils.load_utils import cache_inputs_and_kwargs, load_model
 from ..utils.utils import (calculate_ranks, cleanup_memory, extract_hidden_states, find_layers, get_decoder_layers,
-                           get_layers_to_factorize, set_seed)
+                           get_layers_to_factorize, QWEN3_5_MODEL_TYPES, set_seed)
 from tqdm import tqdm, trange
 
 
@@ -237,6 +238,13 @@ def compress_block_recon(model, fp_model, dataloader, quant_config):
     model.config.use_cache = False
     # get relevant blocks/layers
     q_blocks = get_decoder_layers(model)
+    linearize_index = quant_config.get("linearize_block_index")
+    if linearize_index is not None:
+        linearize_index = int(linearize_index)
+        if model.config.model_type not in QWEN3_5_MODEL_TYPES:
+            raise ValueError("The linearized-block pilot currently supports Qwen3.5/Qwen3.8 decoder blocks only")
+        if linearize_index >= len(q_blocks):
+            raise ValueError(f"linearize_block_index={linearize_index} is outside the {len(q_blocks)} decoder blocks")
     fp_blocks = get_decoder_layers(fp_model) if fp_model is not None else q_blocks
     reference_model = fp_model if fp_model is not None else model
     if fp_model is not None:
@@ -294,6 +302,46 @@ def compress_block_recon(model, fp_model, dataloader, quant_config):
         # get qblock inputs
         # Tuning only reads this cache. It is updated after all groups finish.
         tuning_inputs = compressed_inputs
+        if i == linearize_index:
+            block_kind = "Gated DeltaNet" if hasattr(q_block, "linear_attn") else (
+                "full attention" if hasattr(q_block, "self_attn") else type(q_block).__name__
+            )
+            linearized_block, diagnostics = fit_linearized_decoder_block(
+                tuning_inputs,
+                target_outputs,
+                max_tokens=int(quant_config.get("linearize_max_tokens", 16384)),
+                ridge=float(quant_config.get("linearize_ridge", 1e-4)),
+                chunk_tokens=int(quant_config.get("linearize_chunk_tokens", 1024)),
+                device=dev,
+            )
+            print(
+                f"Linearized-block pilot: replacing block {i}/{len(q_blocks)-1} ({block_kind}) with one affine map; "
+                f"fit tokens={diagnostics['tokens']}, calibration relative RMSE={diagnostics['relative_rmse']:.5f}, "
+                f"parameters={diagnostics['parameters']:,}. Skipping TuneFP and ADMM for this block."
+            )
+            q_block = linearized_block
+            q_blocks[i] = q_block
+            original_inputs = target_outputs
+            with torch.no_grad():
+                for start in range(0, quant_config['num_calib_samples'], io_batch_size):
+                    end = min(start + io_batch_size, quant_config['num_calib_samples'])
+                    batch_input = compressed_inputs[start:end].to(dev, non_blocking=True)
+                    batch_kwargs = _kwargs_for_batch(kwargs, end - start, dev)
+                    batch_output = extract_hidden_states(q_block(batch_input, **batch_kwargs))
+                    compressed_inputs[start:end] = batch_output.cpu().detach()
+            if fp_model is not None:
+                fp_blocks[i] = fp_block.cpu()
+            q_blocks[i] = q_block.cpu()
+            checkpoint.save(q_blocks[i], i + 1, admm_ranks, original_inputs, compressed_inputs, kwargs)
+
+            del q_block, fp_block, target_outputs, tuning_inputs, batch_input, batch_output, batch_kwargs
+            cleanup_memory()
+
+            if quant_config.get('eval_after_each_block', False):
+                test_ppl = evaluate_ppl_after_block(model, model_name=quant_config['model_id'], dev=dev)
+                print(f"\t\tBlock {i}: Test Data PPL        = {test_ppl:.3f}")
+            continue
+
         # get all linear layers
         sublayers = find_layers(q_block)
         # get importance

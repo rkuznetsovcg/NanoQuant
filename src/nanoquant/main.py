@@ -88,6 +88,13 @@ class TuneArguments:
     rank_allocation_max_uniform_ratio: float = field(default=1.25, metadata={"help": 'Maximum adaptive rank as a multiple of the analytical uniform rank'})
     rank_probe_candidates: int = field(default=0, metadata={"help": 'Maximum measured rank candidates per block; 0 keeps the cheap proxy'})
     rank_probe_iters: int = field(default=50, metadata={"help": 'ADMM iterations per rank probe'})
+    linearize_block_index: Optional[int] = field(
+        default=None,
+        metadata={"help": "Experimental: replace this zero-based Qwen3.8 decoder block with one fitted affine map"},
+    )
+    linearize_max_tokens: int = field(default=16384, metadata={"help": "Maximum calibration tokens used to fit the linearized block"})
+    linearize_chunk_tokens: int = field(default=1024, metadata={"help": "Token microbatch used by the streaming linear fit"})
+    linearize_ridge: float = field(default=1e-4, metadata={"help": "Relative ridge regularization for the linearized-block fit"})
     correlation_block_size: int = field(default=0, metadata={"help": 'Input covariance channel blocks: 0, 128 or 256'})
     correlation_layers: str = field(default="mlp.down_proj", metadata={"help": 'Comma-separated layer globs eligible for bounded correlations'})
     nonfact_plateau_tolerance: float = field(default=0.0, metadata={"help": 'Optional relative epoch plateau tolerance; 0 disables stopping'})
@@ -210,6 +217,10 @@ def main():
         rank_allocation_max_uniform_ratio=tune_args.rank_allocation_max_uniform_ratio,
         rank_probe_candidates=tune_args.rank_probe_candidates,
         rank_probe_iters=tune_args.rank_probe_iters,
+        linearize_block_index=tune_args.linearize_block_index,
+        linearize_max_tokens=tune_args.linearize_max_tokens,
+        linearize_chunk_tokens=tune_args.linearize_chunk_tokens,
+        linearize_ridge=tune_args.linearize_ridge,
         correlation_block_size=tune_args.correlation_block_size,
         correlation_layers=tune_args.correlation_layers,
         nonfact_plateau_tolerance=tune_args.nonfact_plateau_tolerance,

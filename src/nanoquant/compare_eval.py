@@ -352,7 +352,8 @@ def main():
         raise ValueError("Paired comparison requires PPL datasets and zero-shot tasks")
 
     evaluation_code = hashlib.sha256()
-    for relative_path in ("compare_eval.py", "checkpoint_audit.py", "utils/eval_utils.py", "utils/load_utils.py", "modules/linear.py"):
+    for relative_path in ("compare_eval.py", "checkpoint_audit.py", "core/linearized_block.py",
+                          "utils/eval_utils.py", "utils/load_utils.py", "utils/utils.py", "modules/linear.py"):
         evaluation_code.update((Path(__file__).parent/relative_path).read_bytes())
     calibration_digest = hashlib.sha256()
     for data_path in sorted(calibration_path.rglob("*")):
